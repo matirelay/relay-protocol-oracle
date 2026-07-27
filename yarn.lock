@@ -1362,17 +1362,17 @@
   dependencies:
     "@noble/hashes" "1.8.0"
 
+"@noble/curves@^1.0.0", "@noble/curves@^1.7.0":
+  version "1.9.7"
+  resolved "https://registry.yarnpkg.com/@noble/curves/-/curves-1.9.7.tgz#79d04b4758a43e4bca2cbdc62e7771352fa6b951"
+  integrity sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==
+  dependencies:
+    "@noble/hashes" "1.8.0"
+
 "@noble/curves@^1.4.2", "@noble/curves@^1.9.1", "@noble/curves@~1.9.0":
   version "1.9.6"
   resolved "https://registry.yarnpkg.com/@noble/curves/-/curves-1.9.6.tgz#b45ebedca85bb75782f6be7e7f120f0c423c99e0"
   integrity sha512-GIKz/j99FRthB8icyJQA51E8Uk5hXmdyThjgQXRKiv9h0zeRlzSCLIzFw6K1LotZ3XuB7yzlf76qk7uBmTdFqA==
-  dependencies:
-    "@noble/hashes" "1.8.0"
-
-"@noble/curves@^1.7.0":
-  version "1.9.7"
-  resolved "https://registry.yarnpkg.com/@noble/curves/-/curves-1.9.7.tgz#79d04b4758a43e4bca2cbdc62e7771352fa6b951"
-  integrity sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==
   dependencies:
     "@noble/hashes" "1.8.0"
 
@@ -1426,10 +1426,10 @@
   resolved "https://registry.yarnpkg.com/@relay-protocol/settlement-networks/-/settlement-networks-3.0.1.tgz#e1aa80a6372a86504ed82d60cd0495695b3942d9"
   integrity sha512-oJwnuLQ4dgyA9Kv0oOWm7RLwIwjMeX5bePSR3KMPVsQKZhNWzkcZHVp39Xyh0QGrTOVCax6l5DPN6ONuQo5Kbg==
 
-"@relay-protocol/settlement-sdk@0.0.124":
-  version "0.0.124"
-  resolved "https://registry.yarnpkg.com/@relay-protocol/settlement-sdk/-/settlement-sdk-0.0.124.tgz#34118951ba8493022db1cbf862fb06e45743109a"
-  integrity sha512-gmCP3QdWuWBAQON0QCQOa46hD2xU2MViDgF+46uje2byrHu5acKwMm0B7tzcz8sD1+nm5+Vj20OYcYenfhFD4g==
+"@relay-protocol/settlement-sdk@0.0.126":
+  version "0.0.126"
+  resolved "https://registry.yarnpkg.com/@relay-protocol/settlement-sdk/-/settlement-sdk-0.0.126.tgz#cbce1fe9d887f4da948ae3eae786b809b8cc2752"
+  integrity sha512-7vEdV4c8wLQJHfq+0bESuRUBiDJC27K5MoN74slS74LW+JKq51NaIRa0lRJ22OHvDb8zLWuFcUgXX5lhPi9+KA==
   dependencies:
     "@coral-xyz/anchor" "^0.31.1"
     "@noble/hashes" "1.8.0"
@@ -2394,7 +2394,7 @@
     "@typescript-eslint/types" "8.50.0"
     eslint-visitor-keys "^4.2.1"
 
-"@xrplf/isomorphic@^1.0.2":
+"@xrplf/isomorphic@^1.0.0", "@xrplf/isomorphic@^1.0.2":
   version "1.0.2"
   resolved "https://registry.yarnpkg.com/@xrplf/isomorphic/-/isomorphic-1.0.2.tgz#15e6f1e9dba25690f0e7585568554a7a1cb01cdd"
   integrity sha512-ncZUdMXr6VlSXtdoiDi0jTH+gBrgGxwVeEidhoegII3PmyErbQsyj6e+j7acmR4LW/lvBkPkzb9QzRfJH0n3rA==
@@ -5623,7 +5623,7 @@ ripemd160@^2.0.0, ripemd160@^2.0.1:
     hash-base "^3.1.2"
     inherits "^2.0.4"
 
-ripple-address-codec@5.0.1, ripple-address-codec@^5.0.1:
+ripple-address-codec@5.0.1, ripple-address-codec@^5.0.0, ripple-address-codec@^5.0.1:
   version "5.0.1"
   resolved "https://registry.yarnpkg.com/ripple-address-codec/-/ripple-address-codec-5.0.1.tgz#63d4245bf716753432ff46724c8f018c0a6de30c"
   integrity sha512-JQHLKuVJV8lv9Qobmn4aUM2Dpv9WRRLKnNWfM8tN02fAbUtG8mUPsu9q9UYX8P76G4qzytEc5ZKMp/3JggNYmw==
@@ -5639,6 +5639,15 @@ ripple-binary-codec@2.8.0:
     "@xrplf/isomorphic" "^1.0.2"
     bignumber.js "^10.0.2"
     ripple-address-codec "^5.0.1"
+
+ripple-keypairs@2.0.0:
+  version "2.0.0"
+  resolved "https://registry.yarnpkg.com/ripple-keypairs/-/ripple-keypairs-2.0.0.tgz#4a1a8142e9a58c07e61b3cc6cfe7317db718d289"
+  integrity sha512-b5rfL2EZiffmklqZk1W+dvSy97v3V/C7936WxCCgDynaGPp7GE6R2XO7EU9O2LlM/z95rj870IylYnOQs+1Rag==
+  dependencies:
+    "@noble/curves" "^1.0.0"
+    "@xrplf/isomorphic" "^1.0.0"
+    ripple-address-codec "^5.0.0"
 
 rpc-websockets@^9.0.2:
   version "9.1.3"

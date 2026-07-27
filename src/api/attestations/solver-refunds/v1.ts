@@ -11,6 +11,7 @@ import {
   getPeerResponses,
   orderSchema,
 } from "../../utils";
+import { isValidApiKey } from "../../../common/api-key";
 import { signExecutionMessage } from "../../../common/signer";
 import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
@@ -159,8 +160,8 @@ export default {
   ) => {
     // Restrict the `force` option to only valid API keys
     if (req.body.force) {
-      const apiKey = req.headers["x-api-key"] as string | undefined;
-      if (!apiKey || !config.apiKeys || !config.apiKeys[apiKey]) {
+      const apiKey = req.headers["x-api-key"];
+      if (!isValidApiKey(apiKey)) {
         return reply
           .status(400)
           .send({ message: "Unauthorized to use the `force` option" });

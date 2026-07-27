@@ -126,6 +126,51 @@ describe("POST /attestations/withdraw-request-authorization/v1 — recoverMode",
     expect(signAllocatorWithdrawRequest).not.toHaveBeenCalled();
   });
 
+  it("supports xrp-vm recoverMode authorization (slow refund)", async () => {
+    (getChain as jest.Mock)
+      .mockResolvedValueOnce({
+        id: "xrp",
+        vmType: "xrp-vm",
+        depository: "rEgPcf61jqzyxHMqStaX7GsC9Swb1srgur",
+      } as never)
+      .mockResolvedValueOnce({
+        id: "ethereum",
+        vmType: "ethereum-vm",
+        depository: "0xDep0000000000000000000000000000000000abcd",
+      } as never);
+
+    const xrpAdditionalData = {
+      "xrp-vm": {
+        sequence: 105458838,
+        fee: "10",
+        lastLedgerSequence: 105565650,
+        flags: 2147483648,
+      },
+    };
+    const body = {
+      ...recoverBody(),
+      chainId: "xrp",
+      currency: "rrrrrrrrrrrrrrrrrrrrrhoLvTp",
+      receiver: "rMeb13qr92ScuX8eCADmVNuBk4G6z1tHJL",
+      additionalData: xrpAdditionalData,
+    };
+
+    const reply = makeReply();
+    await (endpoint as any).handler({ body, headers: {} } as any, reply);
+
+    expect(validateRecoverMode).toHaveBeenCalledTimes(1);
+    expect(verifyOwnerSignature).not.toHaveBeenCalled();
+    expect(normalizeWithdrawRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        vmType: "xrp-vm",
+        chainId: "xrp",
+        depository: "rEgPcf61jqzyxHMqStaX7GsC9Swb1srgur",
+        additionalData: xrpAdditionalData,
+      }),
+    );
+    expect(signAllocatorWithdrawRequest).toHaveBeenCalledWith(NORMALIZED);
+  });
+
   it("supports lighter-vm withdraw request authorization", async () => {
     (getChain as jest.Mock)
       .mockResolvedValueOnce({

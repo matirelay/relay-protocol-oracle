@@ -9,7 +9,7 @@
   "genericMappingAddress": "0xffb396f168d5116972a1e5cceea323b2622d288c",
   "allocatorAddress": "0x95bb2652BaA8a1177f750d92384527c5814f5254",
   "executorAddress": "0x8e4740962E0B8fF64A3AE44409572F33f34D97AE",
-  "depositAddressManagerAddress": "0xde84260b705a4730705dd248e6a7cbbee8e2ada",
+  "depositAddressManagerAddress": "0xc4d8afb323c316dd7c91ddd4f818d5accd0661e3",
   "auroraHttpRpcUrl": "https://mainnet.aurora.dev",
   "auroraEvmChainId": "1313161554",
   "auroraAllocatorAddress": "0x45348c213bf7ddb8e45f34ca4f333307a78ecb9a",

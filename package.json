@@ -29,7 +29,7 @@
     "@nktkas/hyperliquid": "0.25.1",
     "@relay-protocol/abis": "2.0.0",
     "@relay-protocol/settlement-networks": "3.0.1",
-    "@relay-protocol/settlement-sdk": "0.0.124",
+    "@relay-protocol/settlement-sdk": "0.0.126",
     "@reservoir0x/lighter-ts-sdk": "1.0.7-alpha11",
     "@sinclair/typebox": "0.34.38",
     "@solana/spl-memo": "0.2.5",
@@ -47,6 +47,8 @@
     "bs58": "6.0.0",
     "fastify": "5.4.0",
     "json-stable-stringify": "1.3.0",
+    "ripple-binary-codec": "2.8.0",
+    "ripple-keypairs": "2.0.0",
     "tronweb": "6.0.4",
     "viem": "2.33.3",
     "winston": "3.17.0"

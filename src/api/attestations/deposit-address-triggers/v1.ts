@@ -69,6 +69,10 @@ const Schema = {
         priceImpactBps: Type.String({
           description: "Maximum allowed price impact, in basis points",
         }),
+        salt: Type.String({
+          description:
+            "Random uint256 value that makes the deposit address unique",
+        }),
       },
       {
         description: "Fields that deterministically derive the deposit address",

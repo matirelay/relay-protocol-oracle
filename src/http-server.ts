@@ -4,6 +4,7 @@ import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import Fastify, { FastifyInstance } from "fastify";
 
 import { setupEndpoints } from "./api";
+import { isValidApiKey } from "./common/api-key";
 import { logger } from "./common/logger";
 import { createFixedWindowRateLimiter } from "./common/rate-limit";
 import { config } from "./config";
@@ -65,10 +66,9 @@ export const buildHttpServer = async () => {
       return done();
     }
 
-    const apiKey = req.headers["x-api-key"] as string | undefined;
-    const hasValidApiKey = Boolean(apiKey && config.apiKeys?.[apiKey]);
+    const apiKey = req.headers["x-api-key"];
 
-    if (!hasValidApiKey) {
+    if (!isValidApiKey(apiKey)) {
       const rateLimit = unauthenticatedRateLimiter.check(req.ip);
       const retryAfterSeconds = Math.ceil(rateLimit.resetMs / 1000);
 

@@ -14,6 +14,16 @@ const { payments, Transaction, script, opcodes, networks, initEccLib } =
   bitcoin;
 import * as bitcoinMessage from "bitcoinjs-message";
 import * as tronweb from "tronweb";
+import {
+  encode as encodeXrplTx,
+  encodeForSigning as encodeXrplForSigning,
+} from "ripple-binary-codec";
+import {
+  deriveAddress as deriveXrplAddress,
+  deriveKeypair,
+  generateSeed,
+  sign as signXrpl,
+} from "ripple-keypairs";
 
 import { Chain } from "../../../src/common/chains";
 import type { OwnerSignatureData } from "../../../src/common/signature-verification";
@@ -124,6 +134,47 @@ const signEvmMessage = async (
   return account.signMessage({
     message: { raw: `0x${digest}` as Hex },
   });
+};
+
+// Helper: XRPL keypair (master key) for either curve
+const xrpKeypair = (algorithm: "ecdsa-secp256k1" | "ed25519") => {
+  const seed = generateSeed({ algorithm });
+  const { privateKey, publicKey } = deriveKeypair(seed);
+  return { privateKey, publicKey, address: deriveXrplAddress(publicKey) };
+};
+
+// Helper: sign the canonical never-submittable AccountSet carrying the digest
+// memo. `signOverrides` only alters the content that gets SIGNED, producing a
+// blob whose TxnSignature covers different bytes than the blob carries.
+const signXrpAuthorization = (
+  data: OwnerSignatureData,
+  keypair: { privateKey: string; publicKey: string; address: string },
+  overrides?: Record<string, unknown>,
+  signOverrides?: Record<string, unknown>,
+) => {
+  const digest = computeDigest(data);
+  const tx: Record<string, unknown> = {
+    TransactionType: "AccountSet",
+    Account: keypair.address,
+    Fee: "0",
+    Sequence: 0,
+    SigningPubKey: keypair.publicKey,
+    Memos: [
+      {
+        Memo: {
+          MemoData: Buffer.from(`0x${digest}`, "utf-8")
+            .toString("hex")
+            .toUpperCase(),
+        },
+      },
+    ],
+    ...overrides,
+  };
+  const txnSignature = signXrpl(
+    encodeXrplForSigning({ ...tx, ...signOverrides }),
+    keypair.privateKey,
+  );
+  return encodeXrplTx({ ...tx, TxnSignature: txnSignature });
 };
 
 // Helper: Solana (Ed25519 sign over SHA256 hex string as UTF-8 bytes)
@@ -497,6 +548,11 @@ beforeAll(() => {
     id: "lighter-mainnet",
     vmType: "lighter-vm",
     httpRpcUrl: "http://localhost:8080",
+  };
+  mockChains["xrp"] = {
+    id: "xrp",
+    vmType: "xrp-vm",
+    httpRpcUrl: "http://localhost:5005",
   };
 });
 
@@ -1390,6 +1446,146 @@ describe("verifyOwnerSignature", () => {
           signature,
         }),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe("XRP signed-tx-blob authorization", () => {
+    const secp = xrpKeypair("ecdsa-secp256k1");
+    const eddsa = xrpKeypair("ed25519");
+    const xrpData = (owner: string): OwnerSignatureData => ({
+      ...baseData,
+      ownerChainId: "xrp",
+      owner,
+    });
+
+    it("should pass with a valid secp256k1-signed AccountSet blob", async () => {
+      const data = xrpData(secp.address);
+      const signature = signXrpAuthorization(data, secp);
+      await expect(
+        verifyOwnerSignature({ data, signature }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("should pass with a valid ed25519-signed AccountSet blob", async () => {
+      const data = xrpData(eddsa.address);
+      const signature = signXrpAuthorization(data, eddsa);
+      await expect(
+        verifyOwnerSignature({ data, signature }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("should throw when the digest memo does not match the request", async () => {
+      const data = xrpData(secp.address);
+      const signature = signXrpAuthorization(data, secp);
+      const tampered = { ...data, amount: "2000000" };
+      await expect(
+        verifyOwnerSignature({ data: tampered, signature }),
+      ).rejects.toThrow(/memo must equal the digest/);
+    });
+
+    it("should throw for a non-AccountSet transaction", async () => {
+      const data = xrpData(secp.address);
+      const signature = signXrpAuthorization(data, secp, {
+        TransactionType: "Payment",
+        Amount: "1",
+        Destination: eddsa.address,
+      });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must be an AccountSet/,
+      );
+    });
+
+    it("should throw for a submittable Fee", async () => {
+      const data = xrpData(secp.address);
+      const signature = signXrpAuthorization(data, secp, { Fee: "10" });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must be an AccountSet with Fee 0 and Sequence 0/,
+      );
+    });
+
+    it("should throw for a submittable Sequence", async () => {
+      const data = xrpData(secp.address);
+      const signature = signXrpAuthorization(data, secp, { Sequence: 105458838 });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must be an AccountSet with Fee 0 and Sequence 0/,
+      );
+    });
+
+    it("should throw when the blob carries account flags", async () => {
+      const data = xrpData(secp.address);
+      // asfDisableMaster — the most dangerous flag if the blob ever became submittable
+      const signature = signXrpAuthorization(data, secp, { SetFlag: 4 });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must not carry account flags/,
+      );
+    });
+
+    it("should throw when the blob carries a TicketSequence", async () => {
+      const data = xrpData(secp.address);
+      // Sequence 0 + TicketSequence is submittable on-ledger — must be rejected
+      const signature = signXrpAuthorization(data, secp, {
+        TicketSequence: 105458838,
+      });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must not carry account flags or a TicketSequence/,
+      );
+    });
+
+    it("should throw when the blob carries more than one memo", async () => {
+      const data = xrpData(secp.address);
+      const memo = {
+        Memo: {
+          MemoData: Buffer.from(`0x${computeDigest(data)}`, "utf-8")
+            .toString("hex")
+            .toUpperCase(),
+        },
+      };
+      const signature = signXrpAuthorization(data, secp, {
+        Memos: [memo, memo],
+      });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /must carry exactly one memo/,
+      );
+    });
+
+    it("should throw when owner differs from the signed account", async () => {
+      // Memo carries the correct digest and the signature is valid, but the
+      // signing account is not the request owner.
+      const data = xrpData(eddsa.address);
+      const signature = signXrpAuthorization(data, secp);
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /Signer does not match owner/,
+      );
+    });
+
+    it("should throw for a RegularKey-style signer (pubkey derives a different address)", async () => {
+      const data = xrpData(secp.address);
+      // Account claims secp's address but the signing key is eddsa's — verifies
+      // cryptographically, fails the master-key derivation check.
+      const signature = signXrpAuthorization(data, eddsa, {
+        Account: secp.address,
+      });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /Signer does not match owner/,
+      );
+    });
+
+    it("should throw when the signature does not verify", async () => {
+      const data = xrpData(secp.address);
+      // TxnSignature produced over different content than the blob carries
+      const signature = signXrpAuthorization(data, secp, undefined, {
+        Sequence: 1,
+      });
+      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+        /Invalid signature/,
+      );
+    });
+
+    it("should throw for a garbage blob", async () => {
+      const data = xrpData(secp.address);
+      await expect(
+        verifyOwnerSignature({ data, signature: "0xdeadbeef" }),
+      ).rejects.toThrow(/Invalid xrp-vm signed transaction blob/);
     });
   });
 });

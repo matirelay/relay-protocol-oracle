@@ -8,7 +8,7 @@
   "oracleMultisigAddress": "0x2a72eb8cf0233a3dc6198683c83b1078de6fa2b0",
   "genericMappingAddress": "0x822b4c4713433c6b88547845850a39343bf0957e",
   "allocatorAddress": "0x613d3c588f6b8f89302b463f8f19f7241b2857e2",
-  "executorAddress": "0x4a235cd4d004b1cc78ade9811df6fc607e646264",
+  "executorAddress": "0x6747c7e64b90dccc0d54f865cbd9513156adbc0c",
   "auroraHttpRpcUrl": "https://mainnet.aurora.dev",
   "auroraEvmChainId": "1313161554",
   "auroraAllocatorAddress": "0x7eda04920f22ba6a2b9f2573fd9a6f6f1946ff9f",

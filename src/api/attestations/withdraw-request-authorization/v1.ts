@@ -45,6 +45,7 @@ const SUPPORTED_WITHDRAW_VM_TYPES = [
   "solana-vm",
   "ton-vm",
   "tron-vm",
+  "xrp-vm",
 ];
 
 const normalizedWithdrawRequestsEqual = (

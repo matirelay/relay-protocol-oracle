@@ -5,6 +5,18 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { Verifier as Bip322Verifier } from "bip322-js";
 import { Address as TonAddress } from "@ton/core";
 import { Address, Hex, keccak256, recoverAddress, verifyMessage } from "viem";
+import {
+  decode as decodeXrplTx,
+  encodeForSigning as encodeXrplForSigning,
+} from "ripple-binary-codec";
+import {
+  deriveAddress as deriveXrplAddress,
+  verify as verifyXrplSignature,
+} from "ripple-keypairs";
+
+import { encodeAddressToHex } from "@relay-protocol/settlement-sdk";
+
+import { XrpMemo } from "./vm/xrp-vm/rpc";
 
 import { Chain, getChain } from "./chains";
 import { externalError } from "./error";
@@ -65,6 +77,9 @@ export const verifyOwnerSignature = async ({
 
     case "ton-vm":
       return verifyTonSignData(data, signature, ownerChain);
+
+    case "xrp-vm":
+      return verifyXrpSignedTxBlob(data, signature);
 
     default:
       throw externalError(
@@ -331,6 +346,97 @@ const verifyBitcoinMessage = (
     logger.warn(
       "signature-verification",
       `Bitcoin signature verification error for ${data.owner}: ${error}`,
+    );
+  }
+  if (!isValid) {
+    throw externalError("Invalid signature");
+  }
+};
+
+// xrp-vm: no personal_sign equivalent exists across XRPL wallets, so the owner
+// signs a canonical never-submittable AccountSet whose single Memo is the
+// digest as UTF-8 "0x<hex>" — the same memo convention as xrp-vm deposits.
+// Never-submittable: Fee "0" is below the network fee floor, and Sequence 0 is
+// invalid without a ticket — TicketSequence is rejected so the ticket path
+// cannot re-validate it. The envelope is the signed tx
+// blob itself; SigningPubKey travels inside it (XRPL account roots don't store
+// the master pubkey). Master-key signatures only: a RegularKey signer derives a
+// different address and is rejected.
+const verifyXrpSignedTxBlob = (data: OwnerSignatureData, signature: string) => {
+  let tx: Record<string, unknown>;
+  try {
+    tx = decodeXrplTx(
+      signature.startsWith("0x") ? signature.slice(2) : signature,
+    );
+  } catch {
+    throw externalError("Invalid xrp-vm signed transaction blob");
+  }
+
+  if (
+    tx.TransactionType !== "AccountSet" ||
+    tx.Fee !== "0" ||
+    tx.Sequence !== 0
+  ) {
+    throw externalError(
+      "xrp-vm authorization must be an AccountSet with Fee 0 and Sequence 0",
+    );
+  }
+  if (
+    tx.SetFlag !== undefined ||
+    tx.ClearFlag !== undefined ||
+    tx.TicketSequence !== undefined
+  ) {
+    throw externalError(
+      "xrp-vm authorization must not carry account flags or a TicketSequence",
+    );
+  }
+
+  const signingPubKey = tx.SigningPubKey as string | undefined;
+  const txnSignature = tx.TxnSignature as string | undefined;
+  if (!signingPubKey || !txnSignature) {
+    throw externalError("Missing SigningPubKey or TxnSignature");
+  }
+
+  // Signer identity before the costlier curve verify. deriveAddress and the
+  // decoded Account are both canonical classic form; only data.owner needs
+  // X-address normalization.
+  let matches = false;
+  try {
+    matches =
+      deriveXrplAddress(signingPubKey) === tx.Account &&
+      encodeAddressToHex(data.owner, "xrp-vm") ===
+        encodeAddressToHex(tx.Account as string, "xrp-vm");
+  } catch {
+    // encodeAddress throws on malformed addresses — treat as mismatch
+  }
+  if (!matches) {
+    throw externalError("Signer does not match owner");
+  }
+
+  const memos = (tx.Memos ?? []) as XrpMemo[];
+  if (memos.length !== 1) {
+    throw externalError("xrp-vm authorization must carry exactly one memo");
+  }
+  const memoText = Buffer.from(memos[0].Memo?.MemoData ?? "", "hex")
+    .toString("utf-8")
+    .toLowerCase();
+  if (memoText !== `0x${computeDigest(data)}`) {
+    throw externalError("xrp-vm authorization memo must equal the digest");
+  }
+
+  // encodeForSigning re-serializes only the signing fields with the STX prefix,
+  // so the verified bytes are exactly what the wallet signed.
+  let isValid = false;
+  try {
+    isValid = verifyXrplSignature(
+      encodeXrplForSigning(tx),
+      txnSignature,
+      signingPubKey,
+    );
+  } catch (error) {
+    logger.warn(
+      "signature-verification",
+      `xrp-vm signature verification error for ${data.owner}: ${error}`,
     );
   }
   if (!isValid) {

@@ -1,7 +1,12 @@
 {
-  "id": "relay-testnet",
-  "httpRpcUrl": "$RELAY_RPC_URL",
-  "evmChainId": "537724",
-  "oracleAddress": "0x259813B665C8f6074391028ef782e27B65840d89",
-  "oracleVersion": "1"
+  "id": "arbitrum-sepolia",
+  "httpRpcUrl": "$ARBITRUM_SEPOLIA_RPC_URL",
+  "evmChainId": "421614",
+  "hubAddress": "0xa884543c91156098B2e50aE17c3840770B7B55f5",
+  "oracleAddress": "0x5C874Be77a17a150F883a3B31224298DC0D02DA5",
+  "oracleVersion": "1",
+  "oracleMultisigAddress": "0xffb396F168d5116972A1e5CcEEa323B2622D288c",
+  "genericMappingAddress": "0xFCAC667Eb2369AB9b4c0c602ACE72181b3D11327",
+  "allocatorAddress": "0xf62Db37A0d07f7226292CE360225A329510A7F3a",
+  "executorAddress": "0x765BbA44c75924483b803592fbF1d6738dC99107"
 }
