@@ -51,6 +51,8 @@ const VM_TYPE = "ethereum-vm";
 
 const ZKSYNC_ERC20_ETH = "0x000000000000000000000000000000000000800a";
 
+const TX_ID_REGEX = /^0x[0-9a-f]{64}$/;
+
 export class EthereumVmAttestor extends VmAttestor {
   public async getDepositoryDepositMessages(
     chainId: string,
@@ -59,6 +61,8 @@ export class EthereumVmAttestor extends VmAttestor {
     opts?: { mode?: DepositMode },
   ): Promise<EnhancedDepositoryDepositMessage[]> {
     const trackingId = getTrackingId();
+
+    this._requireCanonicalTransactionId(transactionId);
 
     const rpc = await httpRpc(chainId);
 
@@ -298,7 +302,7 @@ export class EthereumVmAttestor extends VmAttestor {
     const defaultBlocks = await this._getFinalizationBlocks(chainId);
     const defaultTime = await this._getFinalizationTime(chainId);
     if (opts?.mode === "fast" && chain.additionalData?.fastMode) {
-      const { required, usedDefaults, tiers } = resolveAmountTieredFinality(
+      const { required, mode, tiers } = resolveAmountTieredFinality(
         chain,
         messages,
         {
@@ -311,7 +315,7 @@ export class EthereumVmAttestor extends VmAttestor {
       }
 
       messages.forEach((m, i) => {
-        m.extraData.mode = usedDefaults ? "slow" : "fast";
+        m.extraData.mode = mode;
         if (m.extraData.mode === "fast") {
           m.extraData.fastFeeBps = tiers[i]?.feeBps;
         }
@@ -413,6 +417,8 @@ export class EthereumVmAttestor extends VmAttestor {
   ): Promise<bigint> {
     const trackingId = getTrackingId();
 
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
 
     // Ensure the transaction was successfully included
@@ -510,6 +516,8 @@ export class EthereumVmAttestor extends VmAttestor {
   ): Promise<boolean> {
     const trackingId = getTrackingId();
 
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
     const chain = await getChain(chainId);
 
@@ -576,6 +584,15 @@ export class EthereumVmAttestor extends VmAttestor {
     }
 
     return true;
+  }
+
+  // Validate the transaction id against the canonical EVM transaction hash format.
+  private _requireCanonicalTransactionId(transactionId: string) {
+    if (!TX_ID_REGEX.test(transactionId)) {
+      throw externalError(
+        `Invalid ethereum-vm transaction id ${transactionId}: expected 0x + 64 lowercase hex chars`,
+      );
+    }
   }
 
   private _DEFAULT_FINALIZATION_BLOCKS = 10;

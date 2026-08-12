@@ -53,6 +53,7 @@ At minimum, a raw-key deployment needs:
 ENVIRONMENT=mainnets.prod
 ECDSA_PRIVATE_KEY=0x...
 RELAY_RPC_URL=https://rpc.chain.relay.link/rpc
+WITHDRAW_GAS_PAYER_ADDRESS=0x...
 ```
 
 Notes:
@@ -61,6 +62,8 @@ Notes:
 - `RELAY_RPC_URL` is the RPC endpoint for the Relay hub chain. It is required for
   the `mainnets.prod` / `mainnets.stag` configs.
 - `ECDSA_PRIVATE_KEY` is required for the default signing path.
+- `WITHDRAW_GAS_PAYER_ADDRESS` is required when serving
+  `/attestations/withdraw-gas-payment-authorization/v1`.
 - `SIGNING_MODULE=raw-private-key` is optional because raw-key signing is the default path, but setting it explicitly is fine.
 - The service currently supports `raw-private-key` and `aws-kms`.
 
@@ -95,7 +98,11 @@ BITCOIN_RPC_URL=
 HYPERLIQUID_RPC_URL=
 PORT=3000
 PEERS=https://peer-one.example.com|peer-api-key;https://peer-two.example.com|peer-api-key
-PEER_REQUEST_TIMEOUT_MS=5000
+PEER_REQUEST_TIMEOUT_MS=10000
+ORACLE_SIGNERS=0x1111111111111111111111111111111111111111;0x2222222222222222222222222222222222222222;0x3333333333333333333333333333333333333333
+ORACLE_SIGNERS_THRESHOLD=2
+ALLOCATOR_EVENT_ATTESTATION=false
+RELAY_WS_URL=wss://rpc.chain.relay.link/ws
 ```
 
 Notes:
@@ -104,8 +111,15 @@ Notes:
 - On Railway, add `PORT` in the service settings.
 - If `PORT` is present, it takes precedence over `HTTP_PORT`.
 - You can set only the RPC vars you want to override; if unset, the oracle uses built-in defaults where available.
-- `PEERS` enables best-effort peer signature fanout for execution-producing requests.
-- `PEER_REQUEST_TIMEOUT_MS` defaults to `5000`.
+- `PEERS` enables best-effort signature fanout for peer-enabled attestation requests.
+- `PEER_REQUEST_TIMEOUT_MS` defaults to `10000`.
+- `ORACLE_SIGNERS` is the semicolon-separated allowlist used to count unique oracle signatures.
+- `ORACLE_SIGNERS_THRESHOLD` is the total number of allowlisted signatures required and defaults to `1`.
+- `ALLOCATOR_EVENT_ATTESTATION=true` enables live `RelayAllocator.PayloadBuilt` monitoring.
+- `RELAY_WS_URL` must be a WebSocket endpoint for the configured Relay chain when event monitoring is enabled.
+- Withdrawal attestation cache and event queue limits are fixed operational safeguards documented below.
+
+The withdrawal attestation cache and live event monitor are documented in `docs/event-attestation-cache.md`.
 
 #### RPC and chain service variables
 
@@ -182,6 +196,8 @@ Format:
 
 ```sh
 PEERS=https://peer-a.example.com|peer-a-key;https://peer-b.example.com|peer-b-key
+ORACLE_SIGNERS=0x1111111111111111111111111111111111111111;0x2222222222222222222222222222222222222222;0x3333333333333333333333333333333333333333
+ORACLE_SIGNERS_THRESHOLD=2
 ```
 
 Each `PEERS` entry is:
@@ -195,7 +211,15 @@ Example with the Relay-hosted oracle:
 PEERS=https://oracle.relay.link|peer-api-key
 ```
 
-Peer calls are best-effort. If a peer times out, errors, or does not agree with the local result, it is skipped.
+The local attestation and all peer requests start concurrently. The first matching response group to collect `ORACLE_SIGNERS_THRESHOLD` unique allowlisted signatures is returned. The local oracle does not need to contribute when remote peers reach the threshold first.
+
+Peer calls are best-effort. If a peer times out, errors, fails response validation, or returns a different attestation, it is skipped. If no group reaches the threshold, the strongest valid partial group is returned after all sources settle.
+
+`ORACLE_SIGNERS_THRESHOLD` is a total signature count. For example, a 2-of-3 oracle configuration uses `ORACLE_SIGNERS_THRESHOLD=2`, not `1`. The service fails to start when the value is less than `1`, is not an integer, or exceeds the number of unique entries in `ORACLE_SIGNERS`. Every signer must be a valid nonzero EVM address, and the local signer must be included in the allowlist.
+
+When `ORACLE_SIGNERS` is omitted, the service preserves compatibility by waiting for the local operation and every configured peer instead of completing early at the threshold.
+
+During a rolling upgrade, deploy the new threshold with the new application version on each entry oracle. Older versions interpreted the threshold as additional peer signatures instead of the total signature count.
 
 `pass-through` is also supported in place of a peer key, but dedicated peer keys are the safer default for external operators.
 

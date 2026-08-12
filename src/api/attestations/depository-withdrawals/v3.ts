@@ -1,50 +1,20 @@
 import { Type } from "@fastify/type-provider-typebox";
 
 import {
-  areExecutionsEqual,
-  filterSignaturesByDomain,
   Endpoint,
   ErrorResponses,
   executionSchema,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
-  withdrawRequestAdditionalDataSchema,
+  withdrawRequestSchema,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import { getChain } from "../../../common/chains";
 import { signExecutionMessage } from "../../../common/signer";
-import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
 
 const MessageData = Type.Object({
-  chainId: Type.String({
-    description: "The chain id to withdraw on",
-  }),
-  depository: Type.Optional(
-    Type.String({
-      description:
-        "The depository to withdraw from (defaults to the chain's primary depository)",
-    }),
-  ),
-  currency: Type.String({
-    description: "The currency to withdraw",
-  }),
-  amount: Type.String({
-    description: "The amount to withdraw",
-  }),
-  spenderChainId: Type.String({
-    description: "The chain id of the funds owner",
-  }),
-  spender: Type.String({
-    description: "The owner of the funds",
-  }),
-  receiver: Type.String({
-    description: "The withdrawal recipient",
-  }),
-  nonce: Type.String({
-    description: "Nonce for replay protection",
-  }),
-  additionalData: Type.Optional(withdrawRequestAdditionalDataSchema),
+  ...withdrawRequestSchema.properties,
   requestPeerSignatures: Type.Optional(
     Type.Boolean({
       description:
@@ -96,61 +66,43 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const chain = await getChain(req.body.chainId);
-    const depository = req.body.depository ?? chain.depository!;
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          const chain = await getChain(req.body.chainId);
+          const depository = req.body.depository ?? chain.depository!;
+          const { status, execution } =
+            await new AttestationService().attestDepositoryWithdrawalV3({
+              chainId: req.body.chainId,
+              depository,
+              currency: req.body.currency,
+              amount: req.body.amount,
+              spenderChainId: req.body.spenderChainId,
+              spender: req.body.spender,
+              receiver: req.body.receiver,
+              nonce: req.body.nonce,
+              additionalData: req.body.additionalData,
+              transactionId: req.body.transactionId,
+              hints: req.body.hints,
+            });
+          const localSignature = execution
+            ? await signExecutionMessage(execution)
+            : undefined;
 
-    const attestationService = new AttestationService();
-    const { status, execution } =
-      await attestationService.attestDepositoryWithdrawalV3({
-        chainId: req.body.chainId,
-        depository,
-        currency: req.body.currency,
-        amount: req.body.amount,
-        spenderChainId: req.body.spenderChainId,
-        spender: req.body.spender,
-        receiver: req.body.receiver,
-        nonce: req.body.nonce,
-        additionalData: req.body.additionalData,
-        transactionId: req.body.transactionId,
-        hints: req.body.hints,
-      });
-
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (areExecutionsEqual(peerData.execution, execution)) {
-                return peerData.execution.signatures;
-              }
-
-              return [];
-            },
-          })
-        : [];
-
-    const localExecutionSignature = execution
-      ? await signExecutionMessage(execution)
-      : undefined;
-
-    return reply.send({
-      status,
-      execution:
-        execution && localExecutionSignature
-          ? {
-              ...execution,
-              signatures: [
-                localExecutionSignature,
-                ...filterSignaturesByDomain(
-                  peerSignatures,
-                  localExecutionSignature,
-                  { chainId: "oracleChainId", contract: "oracleContract" },
-                ),
-              ],
-            }
-          : undefined,
-    });
+          return {
+            status,
+            execution:
+              execution && localSignature
+                ? { ...execution, signatures: [localSignature] }
+                : undefined,
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

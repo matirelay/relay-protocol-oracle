@@ -12,7 +12,6 @@ export const httpRpc = async (chainId: string): Promise<PublicClient> => {
   if (client) return client;
 
   const chain = await getChain(chainId);
-
   let url = chain.httpRpcUrl;
 
   // Handle RPCs which require basic authorization

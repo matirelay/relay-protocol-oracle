@@ -30,7 +30,6 @@ jest.mock("../../../../src/common/chains", () => {
       httpRpcUrl: "https://api.hyperliquid.xyz",
       depository: "0x1234567890abcdef1234567890abcdef12345678",
       additionalDepositories: ["0x9876543210fedcba9876543210fedcba98765432"],
-      hubChainId: "1",
     },
   };
   return {
@@ -45,17 +44,10 @@ jest.mock("../../../../src/common/chains", () => {
       oracleAddress: "0x0000000000000000000000000000000000000002",
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress: "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
     }),
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) =>
       chainId === "base" ? "ethereum-vm" : chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) =>
-      chainId === "base" ? "8453" : chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -102,6 +94,54 @@ describe("HyperliquidVmAttestor", () => {
       jest.clearAllMocks();
       // Default: no hub mapping found
       setupHubRpcMock();
+    });
+
+    it("rejects transaction ids which alias to the same transaction", async () => {
+      const transactionId = randomHex(32);
+      const expectedDepositId = randomHex(32);
+
+      // Mock a valid deposit so only the id check can reject the aliases
+      const depositTx = {
+        time: Date.now(),
+        user: testUserAddress,
+        action: {
+          type: "usdSend",
+          signatureChainId: "0x1",
+          hyperliquidChain: "Mainnet",
+          destination: testDepositoryAddress,
+          amount: "100.0",
+          time: 1761563890702,
+        },
+        block: 776752679,
+        hash: transactionId,
+        error: null,
+      };
+
+      setupHubRpcMock({ id: expectedDepositId });
+
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: depositTx,
+        }),
+      });
+
+      const attestor = new HyperliquidVmAttestor();
+      for (const aliased of [
+        transactionId.slice(2),
+        `${transactionId} `,
+        `${transactionId}\n`,
+        `${transactionId}deadbeef`,
+        `0x${transactionId}`,
+        `0x${transactionId.slice(2).toUpperCase()}`,
+      ]) {
+        await expect(
+          attestor.getDepositoryDepositMessages("hyperliquid", aliased),
+        ).rejects.toThrow(/Invalid hyperliquid-vm transaction id/);
+      }
+
+      await expect(
+        attestor.getDepositoryDepositMessages("hyperliquid", transactionId),
+      ).resolves.toHaveLength(1);
     });
 
     it("should correctly parse UsdSend deposit transaction", async () => {
@@ -192,6 +232,84 @@ describe("HyperliquidVmAttestor", () => {
       expect(messages).toHaveLength(1);
       expect(messages[0].result.depositor).toBe(mappedDepositor);
       expect(messages[0].result.depositId).toBe(expectedDepositId);
+    });
+
+    it("should preserve precision for large usdSend deposit amounts", async () => {
+      const transactionId = randomHex(32);
+      const expectedDepositId = randomHex(32);
+
+      const depositTx = {
+        time: Date.now(),
+        user: testUserAddress,
+        action: {
+          type: "usdSend",
+          signatureChainId: "0x1",
+          hyperliquidChain: "Mainnet",
+          destination: testDepositoryAddress,
+          amount: "123456789012345678.12345678",
+          time: 1761563890702,
+        },
+        block: 776752679,
+        hash: transactionId,
+        error: null,
+      };
+
+      setupHubRpcMock({ id: expectedDepositId });
+
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: depositTx,
+        }),
+      });
+
+      const { messages } =
+        await new AttestationService().attestDepositoryDeposits({
+          chainId: "hyperliquid",
+          transactionId,
+        });
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0].result.amount).toBe(
+        "12345678901234567812345678",
+      );
+    });
+
+    it("should truncate unsupported decimals in usdSend deposit amounts", async () => {
+      const transactionId = randomHex(32);
+      const expectedDepositId = randomHex(32);
+
+      const depositTx = {
+        time: Date.now(),
+        user: testUserAddress,
+        action: {
+          type: "usdSend",
+          signatureChainId: "0x1",
+          hyperliquidChain: "Mainnet",
+          destination: testDepositoryAddress,
+          amount: "100.123456789",
+          time: 1761563890702,
+        },
+        block: 776752679,
+        hash: transactionId,
+        error: null,
+      };
+
+      setupHubRpcMock({ id: expectedDepositId });
+
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: depositTx,
+        }),
+      });
+
+      const { messages } =
+        await new AttestationService().attestDepositoryDeposits({
+          chainId: "hyperliquid",
+          transactionId,
+        });
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0].result.amount).toBe("10012345678");
     });
 
     it("should correctly parse SendAsset deposit transaction", async () => {
@@ -648,6 +766,17 @@ describe("HyperliquidVmAttestor", () => {
       chainId: "hyperliquid",
     });
 
+    it("rejects a non-canonical transaction id on the fallback path", async () => {
+      const attestor = new HyperliquidVmAttestor();
+      await expect(
+        attestor.getDepositoryWithdrawalMessage(
+          "hyperliquid",
+          "0x1234",
+          randomHex(32).slice(2),
+        ),
+      ).rejects.toThrow(/Invalid hyperliquid-vm transaction id/);
+    });
+
     it("should return PENDING status when withdrawal not found", async () => {
       setupRpcMock({
         userDetails: async () => ({ txs: [] }),
@@ -976,7 +1105,7 @@ describe("HyperliquidVmAttestor", () => {
       );
     });
 
-    it("should return PENDING (not auto-expire) when past the nonce window but unmatched", async () => {
+    it("should return EXPIRED when past the nonce window and absent from the ledger", async () => {
       const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
         vmType: "hyperliquid-vm",
         withdrawal: {
@@ -997,6 +1126,43 @@ describe("HyperliquidVmAttestor", () => {
 
       setupRpcMock({
         userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: async () => [],
+      });
+
+      const { message } =
+        await new AttestationService().attestDepositoryWithdrawal({
+          chainId: "hyperliquid",
+          withdrawal: encodeWithdrawal(decodedWithdrawal),
+          withdrawalAddressRequest,
+        });
+
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+    });
+
+    it("should remain PENDING during the expiry settlement buffer", async () => {
+      const nonce = Date.now() - 2 * 24 * 3600 * 1000 - 60 * 1000;
+      const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
+        vmType: "hyperliquid-vm",
+        withdrawal: {
+          txType: 1,
+          parameters: {
+            type: "SendAsset",
+            hyperliquidChain: "Mainnet",
+            destination: testUserAddress,
+            sourceDex: "",
+            destinationDex: "spot",
+            token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+            amount: "10.04",
+            fromSubAccount: "",
+            nonce: String(nonce),
+          },
+        },
+      };
+      const ledgerLookup = jest.fn<any>();
+
+      setupRpcMock({
+        userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: ledgerLookup,
       });
 
       const { message } =
@@ -1007,6 +1173,270 @@ describe("HyperliquidVmAttestor", () => {
         });
 
       expect(message.result.status).toBe(DepositoryWithdrawalStatus.PENDING);
+      expect(ledgerLookup).not.toHaveBeenCalled();
+    });
+
+    it("should return EXECUTED when an expired withdrawal is found in the outgoing ledger", async () => {
+      const nonce = Date.now() - 3 * 24 * 3600 * 1000;
+      const transactionId = randomHex(32);
+      const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
+        vmType: "hyperliquid-vm",
+        withdrawal: {
+          txType: 1,
+          parameters: {
+            type: "SendAsset",
+            hyperliquidChain: "Mainnet",
+            destination: testUserAddress,
+            sourceDex: "",
+            destinationDex: "spot",
+            token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+            amount: "10.04",
+            fromSubAccount: "",
+            nonce: String(nonce),
+          },
+        },
+      };
+
+      setupRpcMock({
+        userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: async ({ user }: any) =>
+          user.toLowerCase() === testDepositoryAddress.toLowerCase()
+            ? [
+                {
+                  time: nonce + 1000,
+                  hash: transactionId,
+                  delta: {
+                    type: "send",
+                    user: testDepositoryAddress,
+                    destination: testUserAddress,
+                    nonce,
+                  },
+                },
+              ]
+            : [],
+        txDetails: async () => ({
+          tx: {
+            time: nonce + 1000,
+            user: testDepositoryAddress,
+            action: {
+              type: "sendAsset",
+              hyperliquidChain: "Mainnet",
+              destination: testUserAddress,
+              sourceDex: "",
+              destinationDex: "spot",
+              token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+              amount: "10.04",
+              fromSubAccount: "",
+              nonce,
+            },
+            hash: transactionId,
+            error: null,
+          },
+        }),
+      });
+
+      const { message } =
+        await new AttestationService().attestDepositoryWithdrawal({
+          chainId: "hyperliquid",
+          withdrawal: encodeWithdrawal(decodedWithdrawal),
+          withdrawalAddressRequest,
+        });
+
+      expect(message.result.depository).toBe(testDepositoryAddress);
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXECUTED);
+    });
+
+    it("should paginate ledger updates when checking an expired withdrawal", async () => {
+      const nonce = Date.now() - 3 * 24 * 3600 * 1000;
+      const transactionId = randomHex(32);
+      const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
+        vmType: "hyperliquid-vm",
+        withdrawal: {
+          txType: 1,
+          parameters: {
+            type: "SendAsset",
+            hyperliquidChain: "Mainnet",
+            destination: testUserAddress,
+            sourceDex: "",
+            destinationDex: "spot",
+            token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+            amount: "10.04",
+            fromSubAccount: "",
+            nonce: String(nonce),
+          },
+        },
+      };
+      const ledgerLookup = jest
+        .fn<any>()
+        .mockResolvedValueOnce([
+          {
+            time: nonce + 1000,
+            hash: randomHex(32),
+            delta: {
+              type: "send",
+              user: testUserAddress,
+              nonce: nonce + 1,
+            },
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            time: nonce + 2000,
+            hash: transactionId,
+            delta: {
+              type: "send",
+              user: testDepositoryAddress,
+              nonce,
+            },
+          },
+        ]);
+
+      setupRpcMock({
+        userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: ledgerLookup,
+        txDetails: async () => ({
+          tx: {
+            time: nonce + 2000,
+            user: testDepositoryAddress,
+            action: {
+              type: "sendAsset",
+              hyperliquidChain: "Mainnet",
+              destination: testUserAddress,
+              sourceDex: "",
+              destinationDex: "spot",
+              token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+              amount: "10.04",
+              fromSubAccount: "",
+              nonce,
+            },
+            hash: transactionId,
+            error: null,
+          },
+        }),
+      });
+
+      const { message } =
+        await new AttestationService().attestDepositoryWithdrawal({
+          chainId: "hyperliquid",
+          withdrawal: encodeWithdrawal(decodedWithdrawal),
+          withdrawalAddressRequest,
+        });
+
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXECUTED);
+      expect(ledgerLookup).toHaveBeenCalledTimes(2);
+      expect((ledgerLookup.mock.calls[1][0] as any).startTime).toBe(
+        nonce + 1000,
+      );
+    });
+
+    it("should match an expired UsdSend withdrawal within the ledger amount tolerance", async () => {
+      const nonce = Date.now() - 3 * 24 * 3600 * 1000;
+      const transactionId = randomHex(32);
+      const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
+        vmType: "hyperliquid-vm",
+        withdrawal: {
+          txType: 0,
+          parameters: {
+            type: "UsdSend",
+            hyperliquidChain: "Mainnet",
+            destination: testUserAddress,
+            amount: "100.0",
+            time: String(nonce),
+          },
+        },
+      };
+
+      setupRpcMock({
+        userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: async ({ user }: any) =>
+          user.toLowerCase() === testDepositoryAddress.toLowerCase()
+            ? [
+                {
+                  time: nonce + 1000,
+                  hash: transactionId,
+                  delta: {
+                    type: "internalTransfer",
+                    user: testDepositoryAddress,
+                    destination: testUserAddress,
+                    usdc: "101.5",
+                  },
+                },
+              ]
+            : [],
+        txDetails: async () => ({
+          tx: {
+            time: nonce + 1000,
+            user: testDepositoryAddress,
+            action: {
+              type: "usdSend",
+              hyperliquidChain: "Mainnet",
+              destination: testUserAddress,
+              amount: "100.0",
+              time: nonce,
+            },
+            hash: transactionId,
+            error: null,
+          },
+        }),
+      });
+
+      const { message } =
+        await new AttestationService().attestDepositoryWithdrawal({
+          chainId: "hyperliquid",
+          withdrawal: encodeWithdrawal(decodedWithdrawal),
+          withdrawalAddressRequest,
+        });
+
+      expect(message.result.depository).toBe(testDepositoryAddress);
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXECUTED);
+    });
+
+    it("should skip txDetails for UsdSend ledger entries with a different amount", async () => {
+      const nonce = Date.now() - 3 * 24 * 3600 * 1000;
+      const decodedWithdrawal: ReturnType<typeof decodeWithdrawal> = {
+        vmType: "hyperliquid-vm",
+        withdrawal: {
+          txType: 0,
+          parameters: {
+            type: "UsdSend",
+            hyperliquidChain: "Mainnet",
+            destination: testUserAddress,
+            amount: "100.0",
+            time: String(nonce),
+          },
+        },
+      };
+      const txDetails = jest.fn<any>();
+
+      setupRpcMock({
+        userDetails: async () => ({ txs: [] }),
+        userNonFundingLedgerUpdates: async ({ user }: any) =>
+          user.toLowerCase() === testDepositoryAddress.toLowerCase()
+            ? [
+                {
+                  time: nonce + 1000,
+                  hash: randomHex(32),
+                  delta: {
+                    type: "internalTransfer",
+                    user: testDepositoryAddress,
+                    destination: testUserAddress,
+                    usdc: "97.0",
+                  },
+                },
+              ]
+            : [],
+        txDetails,
+      });
+
+      const { message } =
+        await new AttestationService().attestDepositoryWithdrawal({
+          chainId: "hyperliquid",
+          withdrawal: encodeWithdrawal(decodedWithdrawal),
+          withdrawalAddressRequest,
+        });
+
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+      expect(txDetails).not.toHaveBeenCalled();
     });
 
     it("should handle UsdSend withdrawal type", async () => {
@@ -1108,6 +1538,19 @@ describe("HyperliquidVmAttestor", () => {
   });
 
   describe("getSolverPaidAmount", () => {
+    it("rejects a non-canonical transaction id", async () => {
+      const attestor = new HyperliquidVmAttestor();
+      await expect(
+        attestor.getSolverPaidAmount("hyperliquid", randomHex(32).slice(2), {
+          currency: "0x00000000000000000000000000000000",
+          recipient: testRecipientAddress,
+          orderId: `0x${"ab".repeat(32)}`,
+          extraData: "0x",
+          deadline: 9999999999,
+        }),
+      ).rejects.toThrow(/Invalid hyperliquid-vm transaction id/);
+    });
+
     const setupHubRpcMock = (
       data?: { id: string; createdAt?: number },
     ) => {
@@ -1212,6 +1655,44 @@ describe("HyperliquidVmAttestor", () => {
       );
 
       expect(paidAmount).toBe(10000000000n);
+    });
+
+    it("should preserve precision for large usdSend native currency fills", async () => {
+      const transactionId = randomHex(32);
+      const payment = makePayment();
+
+      const fillTx = {
+        time: Date.now(),
+        user: testSolverAddress,
+        action: {
+          type: "usdSend",
+          signatureChainId: "0x1",
+          hyperliquidChain: "Mainnet",
+          destination: testRecipientAddress,
+          amount: "123456789012345678.12345678",
+          time: 1761563890702,
+        },
+        block: 776752679,
+        hash: transactionId,
+        error: null,
+      };
+
+      setupHubRpcMock({ id: payment.orderId });
+
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: fillTx,
+        }),
+      });
+
+      const attestor = new HyperliquidVmAttestor();
+      const paidAmount = await attestor.getSolverPaidAmount(
+        "hyperliquid",
+        transactionId,
+        payment,
+      );
+
+      expect(paidAmount).toBe(12345678901234567812345678n);
     });
 
     it("should return correct amount for sendAsset spot token fill", async () => {
@@ -1619,58 +2100,85 @@ describe("HyperliquidVmAttestor", () => {
         attestor.getSolverPaidAmount("hyperliquid", transactionId, payment),
       ).rejects.toThrow("Could not retrieve payment currency decimals");
     });
-  });
 
-  describe("validateSubmitWithdrawRequest", () => {
-    const nativeCurrency = "0x00000000000000000000000000000000";
+    it("should truncate unsupported decimals in native currency fill amounts", async () => {
+      const transactionId = randomHex(32);
+      const payment = makePayment();
 
-    const makeWithdrawRequest = (overrides?: Record<string, any>): any => ({
-      chainId: "hyperliquid",
-      depository: testDepositoryAddress,
-      currency: nativeCurrency,
-      amount: "100",
-      spender: testUserAddress,
-      recipient: testUserAddress,
-      nonce: "1",
-      ...overrides,
-    });
+      const fillTx = {
+        time: Date.now(),
+        user: testSolverAddress,
+        action: {
+          type: "usdSend",
+          signatureChainId: "0x1",
+          hyperliquidChain: "Mainnet",
+          destination: testRecipientAddress,
+          amount: "100.123456789",
+          time: 1761563890702,
+        },
+        block: 776752679,
+        hash: transactionId,
+        error: null,
+      };
 
-    beforeEach(() => {
-      jest.clearAllMocks();
-    });
+      setupHubRpcMock({ id: payment.orderId });
 
-    it("should return true for the native currency without additional data", async () => {
-      const attestor = new HyperliquidVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest(),
-      );
-      expect(result).toBe(true);
-    });
-
-    it("should return false for a non-native currency without hyperliquid additional data", async () => {
-      const attestor = new HyperliquidVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest({
-          currency: "0x6d1e7cde53ba9467b783cb7c530ce054",
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: fillTx,
         }),
-      );
-      expect(result).toBe(false);
+      });
+
+      const attestor = new HyperliquidVmAttestor();
+      await expect(
+        attestor.getSolverPaidAmount("hyperliquid", transactionId, payment),
+      ).resolves.toBe(10012345678n);
     });
 
-    it("should return true for a non-native currency with hyperliquid additional data", async () => {
-      const attestor = new HyperliquidVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest({
-          currency: "0x6d1e7cde53ba9467b783cb7c530ce054",
-          additionalData: {
-            "hyperliquid-vm": {
-              currencyHyperliquidSymbol: "USDC",
-              currentTime: Date.now(),
+    it("should truncate unsupported decimals in spot token fill amounts", async () => {
+      const transactionId = randomHex(32);
+      const tokenAddress = "0x6d1e7cde53ba9467b783cb7c530ce054";
+      const payment = makePayment({
+        currency: tokenAddress,
+      });
+
+      const fillTx = {
+        time: Date.now(),
+        user: testSolverAddress,
+        action: {
+          type: "sendAsset",
+          destination: testRecipientAddress,
+          sourceDex: "",
+          destinationDex: "spot",
+          token: `USDC:${tokenAddress}`,
+          amount: "25.1234567",
+          fromSubAccount: "",
+          nonce: 1761563890239,
+        },
+        hash: transactionId,
+        error: null,
+      };
+
+      setupHubRpcMock({ id: payment.orderId });
+
+      setupRpcMock({
+        txDetails: async () => ({
+          tx: fillTx,
+        }),
+        spotMeta: async () => ({
+          tokens: [
+            {
+              tokenId: tokenAddress,
+              szDecimals: 6,
             },
-          },
+          ],
         }),
-      );
-      expect(result).toBe(true);
+      });
+
+      const attestor = new HyperliquidVmAttestor();
+      await expect(
+        attestor.getSolverPaidAmount("hyperliquid", transactionId, payment),
+      ).resolves.toBe(25123456n);
     });
   });
 });

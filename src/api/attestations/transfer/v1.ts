@@ -2,19 +2,16 @@ import { Type } from "@fastify/type-provider-typebox";
 import { generateAddress } from "@relay-protocol/settlement-sdk";
 
 import {
-  areExecutionsEqual,
-  filterSignaturesByDomain,
   Endpoint,
   ErrorResponses,
   executionSchema,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import { getChain } from "../../../common/chains";
 import { signExecutionMessage } from "../../../common/signer";
-import { verifyOwnerSignature } from "../../../common/signature-verification";
-import { config } from "../../../config";
+import { verifyTransferSignature } from "../../../common/signature-verification";
 import { AttestationService } from "../../../services/attestation";
 
 const Schema = {
@@ -67,61 +64,44 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const attestationService = new AttestationService();
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          await verifyTransferSignature({
+            data: req.body,
+            signature: req.body.ownerSignature,
+          });
 
-    // Verify the owner controls the alias holding the funds.
-    await verifyOwnerSignature({
-      data: { ...req.body, operation: "transfer" },
-      signature: req.body.ownerSignature,
-    });
+          const from = generateAddress({
+            family: await getChain(req.body.ownerChainId).then(
+              (chain) => chain.vmType,
+            ),
+            chainId: req.body.ownerChainId,
+            address: req.body.owner,
+          });
+          const { execution } =
+            await new AttestationService().attestTransfer({
+              chainId: req.body.chainId,
+              currency: req.body.currency,
+              amount: req.body.amount,
+              from,
+              to: req.body.recipient,
+              nonce: req.body.nonce,
+            });
 
-    // The alias the funds are credited to on the hub.
-    const from = generateAddress({
-      family: await getChain(req.body.ownerChainId).then(
-        (chain) => chain.vmType,
-      ),
-      chainId: req.body.ownerChainId,
-      address: req.body.owner,
-    });
-
-    const { execution } = await attestationService.attestTransfer({
-      chainId: req.body.chainId,
-      currency: req.body.currency,
-      amount: req.body.amount,
-      from,
-      to: req.body.recipient,
-      nonce: req.body.nonce,
-    });
-
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (areExecutionsEqual(peerData.execution, execution)) {
-                return peerData.execution.signatures;
-              }
-
-              return [];
+          return {
+            execution: {
+              ...execution,
+              signatures: [await signExecutionMessage(execution)],
             },
-          })
-        : [];
-
-    const localExecutionSignature = await signExecutionMessage(execution);
-
-    return reply.send({
-      execution: {
-        ...execution,
-        signatures: [
-          localExecutionSignature,
-          ...filterSignaturesByDomain(peerSignatures, localExecutionSignature, {
-            chainId: "oracleChainId",
-            contract: "oracleContract",
-          }),
-        ],
-      },
-    });
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

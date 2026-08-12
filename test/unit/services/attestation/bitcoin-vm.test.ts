@@ -1,4 +1,11 @@
-import { describe, expect, it, jest, beforeEach } from "@jest/globals";
+import {
+  afterEach,
+  describe,
+  expect,
+  it,
+  jest,
+  beforeEach,
+} from "@jest/globals";
 import {
   DepositoryWithdrawalStatus,
   decodeWithdrawal,
@@ -8,13 +15,16 @@ import axios from "axios";
 import * as bitcoin from "bitcoinjs-lib";
 import { zeroHash } from "viem";
 
-import { Chain } from "../../../../src/common/chains";
+import { Chain, getChains } from "../../../../src/common/chains";
 import { httpRpc } from "../../../../src/common/vm/bitcoin-vm/rpc";
 import { AttestationService } from "../../../../src/services/attestation";
 import { BitcoinVmAttestor } from "../../../../src/services/attestation/vm/bitcoin-vm";
 
 import { randomHex } from "../../../common/utils";
 import { createMockWithdrawalAddressRequest } from "../../../common/withdrawals";
+
+// Bitcoin tx ids are 32-byte hashes, hex without the 0x prefix
+const randomBitcoinTxId = () => randomHex(32).slice(2);
 
 // Test Bitcoin addresses and private keys
 const testDepositoryAddress = "bc1qq2mvrp4g3ugd424dw4xv53rgsf8szkrv853jrc";
@@ -30,7 +40,6 @@ jest.mock("../../../../src/common/chains", () => {
       httpRpcUrl: "http://127.0.0.1:8332",
       depository: "bc1qq2mvrp4g3ugd424dw4xv53rgsf8szkrv853jrc",
       additionalDepositories: ["bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"],
-      hubChainId: "1",
       additionalData: {
         esploraCompatibleApiUrl: "http://localhost:3000",
       },
@@ -46,18 +55,14 @@ jest.mock("../../../../src/common/chains", () => {
       oracleAddress: "0x0000000000000000000000000000000000000002",
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress:
-        "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
+      rateLimiter: {
+        address: "0x00000000000000000000000000000000000000aa",
+        type: "amount",
+      },
     }),
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) =>
       chainId === "base" ? "ethereum-vm" : chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) =>
-      chainId === "base" ? "8453" : chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -82,6 +87,14 @@ jest.mock("axios", () => {
 jest.mock("../../../../src/common/vm/bitcoin-vm/rpc", () => {
   return {
     httpRpc: jest.fn(),
+  };
+});
+// The shared fast path's limiter pre-check hits the network otherwise, and its catch hides it
+jest.mock("../../../../src/common/hub", () => {
+  const original = jest.requireActual("../../../../src/common/hub");
+  return {
+    ...(original as any),
+    getHubHttpRpc: jest.fn(async () => ({ readContract: async () => true })),
   };
 });
 
@@ -301,10 +314,84 @@ const createInputTransaction = (
 };
 
 describe("BitcoinVmAttestor", () => {
+  describe("Esplora authentication", () => {
+    const enterpriseUrl = "https://enterprise.blockstream.info/api";
+    const credentials = {
+      blockstreamClientId: "client-id",
+      blockstreamClientSecret: "client-secret",
+    };
+
+    const getAuthorizationHeader = (attestor: BitcoinVmAttestor) =>
+      (
+        attestor as unknown as {
+          _getEsploraAuthorizationHeader: (
+            url: string,
+            additionalData: Chain["additionalData"],
+          ) => Promise<Record<string, string> | undefined>;
+        }
+      )._getEsploraAuthorizationHeader(enterpriseUrl, credentials);
+
+    it("shares the token cache across attestor instances", async () => {
+      const fetchSpy = jest.spyOn(global, "fetch").mockResolvedValue({
+        json: async () => ({ access_token: "access-token", expires_in: 300 }),
+      } as Response);
+      const firstAttestor = new BitcoinVmAttestor();
+      const secondAttestor = new BitcoinVmAttestor();
+
+      const firstHeader = await getAuthorizationHeader(firstAttestor);
+      const cachedHeader = await getAuthorizationHeader(secondAttestor);
+
+      expect(firstHeader).toEqual({ Authorization: "Bearer access-token" });
+      expect(cachedHeader).toEqual({ Authorization: "Bearer access-token" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+    });
+  });
+
   describe("getDepositoryDepositMessages", () => {
+    it("rejects transaction ids which alias to the same transaction", async () => {
+      const transactionId = randomBitcoinTxId();
+      const depositId = randomHex(32);
+      const depositTx = createDepositTransaction(transactionId, depositId);
+      const inputTxid = depositTx.vin[0].txid;
+      const inputTx = createInputTransaction(inputTxid);
+
+      // Mock a valid deposit so only the id check can reject the aliases
+      setupRpcMock({
+        getTransaction: async (txid: string) => {
+          if (txid === transactionId) {
+            return depositTx;
+          } else if (txid === inputTxid) {
+            return inputTx;
+          }
+          return null;
+        },
+        getBlock: async () => generateBitcoinBlock(depositTx.blockhash),
+      });
+
+      const attestor = new BitcoinVmAttestor();
+      for (const aliased of [
+        `0x${transactionId}`,
+        `${transactionId} `,
+        `${transactionId}\n`,
+        `${transactionId}deadbeef`,
+        transactionId.slice(2),
+        transactionId.toUpperCase(),
+      ]) {
+        await expect(
+          attestor.getDepositoryDepositMessages("bitcoin", aliased),
+        ).rejects.toThrow(/Invalid bitcoin-vm transaction id/);
+      }
+
+      await expect(
+        attestor.getDepositoryDepositMessages("bitcoin", transactionId),
+      ).resolves.toHaveLength(1);
+    });
+
     it("should correctly parse Bitcoin deposit transaction", async () => {
       // Prepare test data
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(transactionId, depositId);
       const inputTxid = depositTx.vin[0].txid;
@@ -341,7 +428,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should sum multiple outputs to the same depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(transactionId, depositId);
       depositTx.vout.push({
@@ -376,7 +463,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should attribute deposits to the single funded additional depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(transactionId, depositId);
       depositTx.vout[0].scriptPubKey.address = testAdditionalDepositoryAddress;
@@ -410,7 +497,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should skip transactions that spend from the primary depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const explicitDepositor = testUserAddress;
       const depositTx = createDepositTransaction(
@@ -443,7 +530,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should skip transactions that spend from an additional depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(transactionId, depositId);
       const inputTxid = depositTx.vin[0].txid;
@@ -474,7 +561,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should throw when multiple depositories receive funds", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(transactionId, depositId);
       depositTx.vout.push({
@@ -511,7 +598,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should use explicit depositor from deposit OP_RETURN metadata", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const explicitDepositor = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
       const depositTx = createDepositTransaction(
@@ -545,7 +632,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should use explicit depositor from OP_RETURN metadata without a deposit id", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const explicitDepositor = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
       const depositTx = createDepositTransaction(
         transactionId,
@@ -578,7 +665,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should use explicit depositor when OP_RETURN deposit id is shorter than 32 bytes", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const explicitDepositor = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
       const shortDepositId = randomHex(16);
       const depositTx = createDepositTransaction(
@@ -612,7 +699,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should skip OP_RETURN deposit ids that are not valid hex", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const invalidDepositId = `0x${"g".repeat(64)}`;
       const validDepositId = randomHex(32);
       const depositTx = createDepositTransaction(
@@ -646,7 +733,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should skip invalid OP_RETURN depositor matches", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const explicitDepositor = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
       const depositTx = createDepositTransaction(
@@ -680,7 +767,7 @@ describe("BitcoinVmAttestor", () => {
     });
 
     it("should fall back to input depositor when the only OP_RETURN depositor is invalid", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositId = randomHex(32);
       const depositTx = createDepositTransaction(
         transactionId,
@@ -732,7 +819,7 @@ describe("BitcoinVmAttestor", () => {
     ])(
       "should ignore malformed OP_RETURN depositor metadata: %s",
       async (_caseName, metadata) => {
-        const transactionId = randomHex(32);
+        const transactionId = randomBitcoinTxId();
         const depositId = randomHex(32);
         const depositTx = createDepositTransaction(
           transactionId,
@@ -767,20 +854,27 @@ describe("BitcoinVmAttestor", () => {
 
     it("should throw error when transaction confirmations are insufficient", async () => {
       // Prepare test data
-      const transactionId = randomHex(32);
+      const transactionId = randomBitcoinTxId();
       const depositTx = createDepositTransaction(
         transactionId,
         zeroHash,
         100000000,
         1,
       ); // Only 1 confirmation
+      const inputTxid = depositTx.vin[0].txid;
+      const inputTx = createInputTransaction(inputTxid);
 
       // Setup RPC mock
       setupRpcMock({
-        getTransaction: jest.fn().mockReturnValue(depositTx),
-        getBlock: jest
-          .fn()
-          .mockReturnValue(generateBitcoinBlock(depositTx.blockhash)),
+        getTransaction: async (txid: string) => {
+          if (txid === transactionId) {
+            return depositTx;
+          } else if (txid === inputTxid) {
+            return inputTx;
+          }
+          return null;
+        },
+        getBlock: async () => generateBitcoinBlock(depositTx.blockhash),
       });
 
       // Execute test and verify error
@@ -790,6 +884,81 @@ describe("BitcoinVmAttestor", () => {
           transactionId,
         }),
       ).rejects.toThrow(`Transaction ${transactionId} is not finalized`);
+    });
+  });
+
+  describe("getSolverPaidAmount", () => {
+    const orderId = randomHex(32);
+    const payment = {
+      currency: "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqmql8k8",
+      recipient: testUserAddress,
+      orderId,
+      extraData: "0x",
+      deadline: Math.floor(Date.now() / 1000) + 3600,
+    };
+
+    // A fill paying `testUserAddress`, carrying one OP_RETURN per entry in `opReturns`
+    const setupFillTx = (opReturns: string[]) => {
+      const transactionId = randomBitcoinTxId();
+      const fillTx = generateBitcoinTransaction(transactionId, {
+        confirmations: 3,
+        vout: [
+          {
+            value: 50000000,
+            n: 0,
+            scriptPubKey: {
+              asm: "0 903168ab6437d7c9fe0a3a9a12c60445956dbb89",
+              desc: `addr(${testUserAddress})`,
+              hex: "0014903168ab6437d7c9fe0a3a9a12c60445956dbb89",
+              type: "witness_v0_keyhash",
+              address: testUserAddress,
+            },
+          },
+          ...opReturns.map((data, index) =>
+            generateOpReturnOutput(data, index + 1),
+          ),
+        ],
+      });
+
+      setupRpcMock({
+        getTransaction: async () => fillTx,
+        getBlock: async () => generateBitcoinBlock(fillTx.blockhash),
+      });
+
+      return transactionId;
+    };
+
+    it("returns the amount paid to the recipient", async () => {
+      const transactionId = setupFillTx([orderId]);
+      await expect(
+        new BitcoinVmAttestor().getSolverPaidAmount(
+          "bitcoin",
+          transactionId,
+          payment,
+        ),
+      ).resolves.toBe(BigInt(50000000));
+    });
+
+    it("rejects a tx that references another order id (double-claim guard)", async () => {
+      const transactionId = setupFillTx([orderId, randomHex(32)]);
+      await expect(
+        new BitcoinVmAttestor().getSolverPaidAmount(
+          "bitcoin",
+          transactionId,
+          payment,
+        ),
+      ).rejects.toThrow("must have exactly one OP_RETURN");
+    });
+
+    it("rejects a tx carrying an unrelated second OP_RETURN", async () => {
+      const transactionId = setupFillTx([orderId, "exchange-routing-tag"]);
+      await expect(
+        new BitcoinVmAttestor().getSolverPaidAmount(
+          "bitcoin",
+          transactionId,
+          payment,
+        ),
+      ).rejects.toThrow("must have exactly one OP_RETURN");
     });
   });
 
@@ -1283,96 +1452,109 @@ describe("BitcoinVmAttestor", () => {
     });
   });
 
-  describe("validateSubmitWithdrawRequest", () => {
-    const utxoTxid = randomHex(32);
+});
 
-    const makeWithdrawRequest = (overrides?: Record<string, any>): any => ({
+describe("BitcoinVmAttestor - fast-finality deposit thresholds", () => {
+  const NATIVE = "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqmql8k8";
+  const AMOUNT = 100000000;
+
+  // Default: a 1-block tier with 1 confirmation, under the 2-block chain default
+  const setAdditionalData = async (
+    maxAmount: string,
+    finalizationBlocks = 1,
+  ) => {
+    (await getChains())["bitcoin"].additionalData = {
+      esploraCompatibleApiUrl: "http://localhost:3000",
+      fastMode: {
+        finalityTiers: {
+          [NATIVE]: [{ maxAmount, finalizationBlocks }],
+        },
+      },
+    };
+  };
+
+  afterEach(async () => {
+    (await getChains())["bitcoin"].additionalData = {
+      esploraCompatibleApiUrl: "http://localhost:3000",
+    };
+  });
+
+  const attestDeposit = async (
+    mode: "fast" | "slow" = "fast",
+    confirmations = 1,
+  ) => {
+    const transactionId = randomBitcoinTxId();
+    const depositTx = createDepositTransaction(
+      transactionId,
+      randomHex(32),
+      AMOUNT,
+      confirmations,
+    );
+    // bitcoind omits blockhash/blocktime while a transaction is still in the mempool
+    if (!confirmations) {
+      delete (depositTx as Partial<typeof depositTx>).blockhash;
+      delete (depositTx as Partial<typeof depositTx>).blocktime;
+    }
+    const inputTxid = depositTx.vin[0].txid;
+    const inputTx = createInputTransaction(inputTxid);
+
+    setupRpcMock({
+      getTransaction: async (txid: string) => {
+        if (txid === transactionId) {
+          return depositTx;
+        } else if (txid === inputTxid) {
+          return inputTx;
+        }
+        return null;
+      },
+      // Mirrors bitcoind: an absent blockhash is an error, not an empty result
+      getBlock: async (blockhash: string) => {
+        if (!blockhash) {
+          throw new Error("blockhash must be of length 64");
+        }
+        return generateBitcoinBlock(blockhash);
+      },
+    });
+
+    return new AttestationService().attestDepositoryDeposits({
       chainId: "bitcoin",
-      depository: testDepositoryAddress,
-      currency: testDepositoryAddress,
-      amount: "100000000",
-      spender: testUserAddress,
-      recipient: testUserAddress,
-      nonce: "1",
-      ...overrides,
+      transactionId,
+      mode,
     });
+  };
 
-    beforeEach(() => {
-      jest.clearAllMocks();
-    });
+  it("applies the matching tier instead of the chain default", async () => {
+    await setAdditionalData("200000000");
 
-    it("should return false when bitcoin additional data is missing", async () => {
-      const attestor = new BitcoinVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest(),
-      );
-      expect(result).toBe(false);
-    });
+    const { messages } = await attestDeposit();
+    expect(messages).toHaveLength(1);
+    expect(messages[0].result.currency).toBe(NATIVE);
+    expect(messages[0].extraData.mode).toBe("fast");
+  });
 
-    it("should return true when all allocator UTXO values match on-chain", async () => {
-      setupRpcMock({
-        getTransaction: async () =>
-          generateBitcoinTransaction(utxoTxid, {
-            vout: [
-              {
-                value: 5000,
-                n: 0,
-                scriptPubKey: {
-                  asm: "",
-                  desc: "",
-                  hex: "",
-                  type: "witness_v0_keyhash",
-                },
-              },
-            ],
-          }),
-      });
+  it("resolves slow when the matching tier is slower than the chain default", async () => {
+    await setAdditionalData("200000000", 3);
 
-      const attestor = new BitcoinVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest({
-          additionalData: {
-            "bitcoin-vm": {
-              allocatorUtxos: [{ txid: utxoTxid, vout: 0, value: "5000" }],
-              feeRate: 1,
-            },
-          },
-        }),
-      );
-      expect(result).toBe(true);
-    });
+    const { messages } = await attestDeposit("fast", 3);
+    expect(messages[0].extraData.mode).toBe("slow");
+    expect(messages[0].extraData.fastFeeBps).toBeUndefined();
+  });
 
-    it("should return false when an allocator UTXO value does not match on-chain", async () => {
-      setupRpcMock({
-        getTransaction: async () =>
-          generateBitcoinTransaction(utxoTxid, {
-            vout: [
-              {
-                value: 4000,
-                n: 0,
-                scriptPubKey: {
-                  asm: "",
-                  desc: "",
-                  hex: "",
-                  type: "witness_v0_keyhash",
-                },
-              },
-            ],
-          }),
-      });
+  it("rejects an unmined transaction even when the tier requires no blocks", async () => {
+    await setAdditionalData("200000000", 0);
 
-      const attestor = new BitcoinVmAttestor();
-      const result = await attestor.validateSubmitWithdrawRequest(
-        makeWithdrawRequest({
-          additionalData: {
-            "bitcoin-vm": {
-              allocatorUtxos: [{ txid: utxoTxid, vout: 0, value: "5000" }],
-              feeRate: 1,
-            },
-          },
-        }),
-      );
-      expect(result).toBe(false);
-    });
+    await expect(attestDeposit("fast", 0)).rejects.toThrow("is not finalized");
+  });
+
+  it("falls back to the chain default when the amount is above all tiers", async () => {
+    await setAdditionalData(AMOUNT.toString());
+
+    await expect(attestDeposit()).rejects.toThrow("is not finalized");
+  });
+
+  it("keeps the default gate on slow mode even when fast is enabled", async () => {
+    await setAdditionalData("200000000");
+
+    await expect(attestDeposit("slow")).rejects.toThrow("is not finalized");
   });
 });

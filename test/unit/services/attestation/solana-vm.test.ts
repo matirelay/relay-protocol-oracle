@@ -1,11 +1,16 @@
-import { describe, expect, it, jest } from "@jest/globals";
+import { afterEach, describe, expect, it, jest } from "@jest/globals";
 
 import { randomBase58 } from "../../../common/utils";
 import { Chain, getChains } from "../../../../src/common/chains";
+import { logger } from "../../../../src/common/logger";
 import { httpRpc } from "../../../../src/common/vm/solana-vm/rpc";
 import { AttestationService } from "../../../../src/services/attestation";
+import { SolanaVmAttestor } from "../../../../src/services/attestation/vm/solana-vm";
 import { privateKeyToAccount } from "viem/accounts";
 import {
+  DecodedSolanaVmWithdrawal,
+  DepositoryWithdrawalStatus,
+  encodeWithdrawal,
   getOrderId,
   Order,
   SolverRefundStatus,
@@ -13,6 +18,8 @@ import {
 import { Hex } from "viem";
 import { randomHex, randomNumber } from "../../../common/utils";
 import {
+  Connection,
+  Finality,
   PublicKey,
   TransactionResponse as SolanaTransactionResponse,
 } from "@solana/web3.js";
@@ -439,6 +446,7 @@ function createFillTransaction(params: {
   solverContractAddress: string;
   paymentAmount: string;
   orderHash: string;
+  extraMemos?: string[];
 }): TransactionResponse {
   const {
     fillTxHash,
@@ -446,14 +454,15 @@ function createFillTransaction(params: {
     solverContractAddress,
     paymentAmount,
     orderHash,
+    extraMemos,
   } = params;
 
-  // Create memo instruction containing order hash
-  const memoInstruction = {
+  // Create memo instructions containing the order hash and any additional memos
+  const memoInstructions = [orderHash, ...(extraMemos ?? [])].map((memo) => ({
     programIdIndex: 0, // Index of the memo program in the accountKeys array
     accountKeyIndexes: [],
-    data: Buffer.from(orderHash, "utf-8"),
-  };
+    data: Buffer.from(memo, "utf-8"),
+  }));
 
   // Create account keys including memo program and recipient
   const accountKeys = [
@@ -467,7 +476,7 @@ function createFillTransaction(params: {
   return generateTransactionResponse(
     fillTxHash,
     [`Program log: Fill executed for order: ${orderHash}`],
-    [memoInstruction],
+    memoInstructions,
     accountKeys,
     {
       paymentRecipient: outputRecipient,
@@ -582,6 +591,7 @@ const setupTestEnvironment = async (
     duplicateOnchainIds?: boolean;
     customPaymentAmount?: string;
     actionType?: "fill" | "refund";
+    extraFillMemos?: string[];
   } = {},
 ) => {
   const chains = Object.values(await getChains());
@@ -667,6 +677,7 @@ const setupTestEnvironment = async (
       solverContractAddress: testData.solverContractAddress,
       paymentAmount: fillAmount,
       orderHash,
+      extraMemos: options.extraFillMemos,
     });
   }
 
@@ -792,6 +803,7 @@ const testAttestSolverFill = async (options: {
   insufficientPayment?: boolean;
   duplicateOnchainIds?: boolean;
   customPaymentAmount?: string;
+  extraFillMemos?: string[];
   expectError?: string;
 }) => {
   // Setup test environment with fill action type
@@ -896,15 +908,13 @@ jest.mock("../../../../src/common/chains", () => {
       vmType: "solana-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "FcdAmYWSixzyEGHaPQmDWXzyVFbiKEU2f4MuJfkLKH3u",
-      hubChainId:
-        "50176979118388105370421134508366610418687875236156196470082648173271157915018",
     },
     ethereum: {
       id: "ethereum",
       vmType: "ethereum-vm",
       httpRpcUrl: "http://127.0.0.1:8546",
       depository: "0x2e988a386a799f506693793c6a5af6b54dfaabfb",
-      hubChainId: "1",
+      additionalData: { evmChainId: "1" },
     },
   };
   return {
@@ -919,18 +929,14 @@ jest.mock("../../../../src/common/chains", () => {
       oracleAddress: "0x0000000000000000000000000000000000000002",
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress:
-        "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
+      rateLimiter: {
+        address: "0x00000000000000000000000000000000000000aa",
+        type: "amount",
+      },
     }),
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) =>
       chainId === "base" ? "ethereum-vm" : chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) =>
-      chainId === "base" ? "8453" : chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -940,6 +946,15 @@ jest.mock("../../../../src/common/chains", () => {
 jest.mock("../../../../src/common/vm/solana-vm/rpc", () => {
   return {
     httpRpc: jest.fn(),
+  };
+});
+// The shared fast path pre-checks the rate limiter over the hub RPC; without this
+// the read escapes to the network and is silently swallowed by its catch
+jest.mock("../../../../src/common/hub", () => {
+  const original = jest.requireActual("../../../../src/common/hub");
+  return {
+    ...(original as any),
+    getHubHttpRpc: jest.fn(async () => ({ readContract: async () => true })),
   };
 });
 
@@ -1712,6 +1727,34 @@ describe("SolanaVmAttestor", () => {
     });
   });
 
+  it("attestSolverFill - logs when a memo references another order id", async () => {
+    const warnSpy = jest
+      .spyOn(logger, "warn")
+      .mockImplementation((() => undefined) as never);
+
+    try {
+      await testAttestSolverFill({
+        extraFillMemos: ["0x" + "cd".repeat(32)],
+      });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [component, message] = warnSpy.mock.calls[0];
+      expect(component).toBe("solana-vm");
+      expect(JSON.parse(message)).toEqual({
+        msg: expect.stringContaining("references multiple order ids"),
+        orderId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        transactionId: expect.any(String),
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("attestSolverFill - allows memos that are not order ids", async () => {
+    await testAttestSolverFill({
+      extraFillMemos: ["exchange-routing-tag-12345"],
+    });
+  });
+
   it("attestSolverFill - validates with spl-token payments", async () => {
     await testAttestSolverFill({
       useSPLToken: true,
@@ -1733,5 +1776,334 @@ describe("SolanaVmAttestor", () => {
     await testAttestSolverRefund({
       useSPLToken: true,
     });
+  });
+
+  describe("getDepositoryWithdrawalMessage", () => {
+    // Real mainnet `UsedRequest` account data: discriminator + `is_used: true`
+    const usedRequestData = Buffer.from("87866e4d9662b46b01", "hex");
+    const expiration = 1_700_000_000;
+
+    const withdrawal: DecodedSolanaVmWithdrawal = {
+      vmType: "solana-vm",
+      withdrawal: {
+        domain: randomHex(32),
+        recipient: randomBase58(32),
+        token: zeroAddress,
+        amount: "100000000",
+        nonce: "1",
+        expiration,
+        vaultAddress: randomBase58(32),
+      },
+    };
+
+    const setupWithdrawalMock = (options: {
+      usedRequestData?: Buffer;
+      usedRequestError?: Error;
+      chainTimestamp?: number;
+    }) => {
+      (httpRpc as jest.Mock).mockImplementation(() => ({
+        rpcEndpoint: "http://127.0.0.1:8545",
+        getSlot: async () => 1000,
+        getBlockTime: async () => options.chainTimestamp ?? expiration - 3600,
+      }));
+
+      jest
+        .spyOn(Connection.prototype, "getAccountInfoAndContext")
+        .mockImplementation(async () => {
+          if (options.usedRequestError) {
+            throw options.usedRequestError;
+          }
+          return {
+            context: { slot: 1000 },
+            value: options.usedRequestData
+              ? {
+                  data: options.usedRequestData,
+                  executable: false,
+                  lamports: 1000,
+                  owner: new PublicKey(zeroAddress),
+                }
+              : null,
+          };
+        });
+    };
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("returns EXECUTED when the used_request PDA exists", async () => {
+      setupWithdrawalMock({ usedRequestData, chainTimestamp: expiration + 1 });
+
+      const message =
+        await new SolanaVmAttestor().getDepositoryWithdrawalMessage(
+          "solana",
+          encodeWithdrawal(withdrawal),
+        );
+
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXECUTED);
+    });
+
+    it("returns EXPIRED when the used_request PDA is missing past the expiration", async () => {
+      setupWithdrawalMock({ chainTimestamp: expiration + 1 });
+
+      const message =
+        await new SolanaVmAttestor().getDepositoryWithdrawalMessage(
+          "solana",
+          encodeWithdrawal(withdrawal),
+        );
+
+      expect(message.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+    });
+
+    it("throws instead of expiring when the used_request read fails", async () => {
+      setupWithdrawalMock({
+        usedRequestError: new Error("rpc timeout"),
+        chainTimestamp: expiration + 1,
+      });
+
+      await expect(
+        new SolanaVmAttestor().getDepositoryWithdrawalMessage(
+          "solana",
+          encodeWithdrawal(withdrawal),
+        ),
+      ).rejects.toThrow("rpc timeout");
+    });
+  });
+});
+
+describe("SolanaVmAttestor - fast-finality deposit tiers", () => {
+  const DEPOSITORY = "FcdAmYWSixzyEGHaPQmDWXzyVFbiKEU2f4MuJfkLKH3u";
+  const NATIVE = "11111111111111111111111111111111";
+  const AMOUNT = 1e6;
+  // Fee-free tier: a non-zero feeBps additionally requires a payer fee
+  // commitment, which is the shared layer's territory, not the VM gate's
+  const FEE_BPS = "0";
+
+  const setFinalityTiers = async (maxAmount: string) => {
+    (await getChains())["solana"].additionalData = {
+      fastMode: {
+        feeRecipient: "0x00000000000000000000000000000000000000ff",
+        finalityTiers: {
+          [NATIVE]: [{ maxAmount, feeBps: FEE_BPS }],
+        },
+      },
+    };
+  };
+
+  afterEach(async () => {
+    delete (await getChains())["solana"].additionalData;
+  });
+
+  const SLOT = 250000000;
+
+  // One `deposit_native` instruction per amount; account index 2 is the depositor
+  const nativeDepositTransaction = (amounts: number[]) => {
+    const accountKeys = [
+      new PublicKey(DEPOSITORY),
+      new PublicKey(randomBase58(32)),
+      new PublicKey(randomBase58(32)),
+    ];
+
+    return {
+      slot: SLOT,
+      meta: {
+        logMessages: [],
+        innerInstructions: [],
+        preTokenBalances: [],
+        postTokenBalances: [],
+        loadedAddresses: { writable: [], readonly: [] },
+      },
+      transaction: {
+        message: {
+          compiledInstructions: amounts.map((amount) => ({
+            programIdIndex: 0,
+            accountKeyIndexes: [0, 1, 2],
+            data: bs58.decode(
+              generateDepositInstructionData(randomHex(32), amount.toString()),
+            ),
+          })),
+          addressTableLookups: [],
+          getAccountKeys: () => ({ staticAccountKeys: accountKeys }),
+        },
+      },
+    };
+  };
+
+  const BLOCK_TIME = 1700000000;
+
+  // Records both bindings of every transaction read: the connection default and the
+  // per-call option (which is the one web3.js actually honours)
+  const mockRpcReads = (
+    transaction: any,
+    status: { slot: number; confirmationStatus: string } | null = null,
+  ) => {
+    const reads: { connection: Finality; call: Finality }[] = [];
+    const statusReads: { searchTransactionHistory?: boolean }[] = [];
+    (httpRpc as jest.Mock).mockImplementation(
+      (_chainId: string, connection: Finality) => ({
+        getTransaction: async (
+          _transactionId: string,
+          config: { commitment: Finality },
+        ) => {
+          reads.push({ connection, call: config.commitment });
+          return transaction;
+        },
+        getBlock: async () => ({ blockTime: BLOCK_TIME }),
+        getSignatureStatuses: async (
+          _signatures: string[],
+          config: { searchTransactionHistory?: boolean },
+        ) => {
+          statusReads.push(config);
+          return { value: [status] };
+        },
+      }),
+    );
+
+    return { reads, statusReads };
+  };
+
+  const readAt = (commitment: Finality) => [
+    { connection: commitment, call: commitment },
+  ];
+
+  const attestDeposit = (mode: "fast" | "slow" = "fast") =>
+    new AttestationService().attestDepositoryDeposits({
+      chainId: "solana",
+      transactionId: randomBase58(32),
+      mode,
+    });
+
+  it("attests off the confirmed read when every deposit matches a tier", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads, statusReads } = mockRpcReads(transaction);
+
+    const { messages } = await attestDeposit();
+    expect(reads).toEqual(readAt("confirmed"));
+    expect(statusReads).toHaveLength(0);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].extraData.mode).toBe("fast");
+    expect(messages[0].extraData.fastFeeBps).toBe(FEE_BPS);
+    expect(messages[0].extraData.timestamp).toBe(String(BLOCK_TIME));
+  });
+
+  it("reuses the confirmed read when the amount is above all tiers and the transaction finalized in the slot it was read at", async () => {
+    await setFinalityTiers(AMOUNT.toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads, statusReads } = mockRpcReads(transaction, {
+      slot: SLOT,
+      confirmationStatus: "finalized",
+    });
+
+    const { messages } = await attestDeposit();
+    expect(reads).toEqual(readAt("confirmed"));
+    expect(statusReads).toEqual([{ searchTransactionHistory: true }]);
+    expect(messages[0].extraData.mode).toBe("slow");
+    expect(messages[0].extraData.fastFeeBps).toBeUndefined();
+  });
+
+  it("throws a retryable error when the amount is above all tiers and the transaction is not finalized yet", async () => {
+    await setFinalityTiers(AMOUNT.toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads } = mockRpcReads(transaction, {
+      slot: SLOT,
+      confirmationStatus: "confirmed",
+    });
+
+    await expect(attestDeposit()).rejects.toThrow("is not finalized");
+    expect(reads).toEqual(readAt("confirmed"));
+  });
+
+  it("throws a retryable error when the amount is above all tiers and the status probe answers null", async () => {
+    await setFinalityTiers(AMOUNT.toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    mockRpcReads(transaction);
+
+    // The confirmed read proved the transaction exists; a null status is a
+    // measurement failure, not an unknown transaction
+    await expect(attestDeposit()).rejects.toThrow("is not finalized");
+  });
+
+  it("throws a retryable error when the transaction finalized in a different slot", async () => {
+    await setFinalityTiers(AMOUNT.toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads } = mockRpcReads(transaction, {
+      slot: SLOT + 1,
+      confirmationStatus: "finalized",
+    });
+
+    // The confirmed read's blockTime no longer matches where the transaction finalized
+    await expect(attestDeposit()).rejects.toThrow("is not finalized");
+    expect(reads).toEqual(readAt("confirmed"));
+  });
+
+  it("resolves the whole transaction slow when one deposit is above its tier", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const transaction = nativeDepositTransaction([AMOUNT, AMOUNT + 1]);
+    const { reads } = mockRpcReads(transaction, {
+      slot: SLOT,
+      confirmationStatus: "finalized",
+    });
+
+    const { messages } = await attestDeposit();
+    expect(reads).toEqual(readAt("confirmed"));
+    expect(messages).toHaveLength(2);
+    expect(messages.map((m) => m.extraData.mode)).toEqual(["slow", "slow"]);
+    expect(messages.map((m) => m.extraData.fastFeeBps)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("throws a retryable error when the confirmed read is empty but the signature is known", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const { reads } = mockRpcReads(null, {
+      slot: SLOT,
+      confirmationStatus: "processed",
+    });
+
+    await expect(attestDeposit()).rejects.toThrow("is not finalized");
+    expect(reads).toEqual(readAt("confirmed"));
+  });
+
+  it("reports no deposits when the confirmed read is empty and the signature is unknown", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const { reads, statusReads } = mockRpcReads(null);
+
+    const { messages } = await attestDeposit();
+    expect(reads).toEqual(readAt("confirmed"));
+    expect(statusReads).toEqual([{ searchTransactionHistory: true }]);
+    expect(messages).toEqual([]);
+  });
+
+  it("still reports no deposits for a readable transaction carrying none", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const transaction = nativeDepositTransaction([]);
+    const { statusReads } = mockRpcReads(transaction);
+
+    const { messages } = await attestDeposit();
+    // Readable-but-empty is a plain answer, not an unreadable transaction
+    expect(statusReads).toHaveLength(0);
+    expect(messages).toEqual([]);
+  });
+
+  it("keeps reading at finalized on slow mode even when fast is configured", async () => {
+    await setFinalityTiers((AMOUNT + 1).toString());
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads, statusReads } = mockRpcReads(transaction);
+
+    const { messages } = await attestDeposit("slow");
+    expect(reads).toEqual(readAt("finalized"));
+    expect(statusReads).toHaveLength(0);
+    expect(messages[0].extraData.mode).toBeUndefined();
+  });
+
+  it("keeps reading at finalized when the chain configures no fast mode", async () => {
+    const transaction = nativeDepositTransaction([AMOUNT]);
+    const { reads } = mockRpcReads(transaction);
+
+    const { messages } = await attestDeposit();
+    expect(reads).toEqual(readAt("finalized"));
+    expect(messages[0].extraData.mode).toBeUndefined();
   });
 });

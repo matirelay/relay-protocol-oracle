@@ -6,6 +6,7 @@ import { encodeAddress, Order, VmType } from "@relay-protocol/settlement-sdk";
 import { getChainVmType } from "./chains";
 import { externalError } from "./error";
 import { AttestationService } from "../services/attestation";
+import { getDeterministicId } from "../services/attestation/utils";
 import { orderSchema } from "../api/utils";
 
 const encodeAddressToHex = (address: string, vmType: VmType) =>
@@ -62,7 +63,7 @@ export async function validateRecoverMode(params: {
   recipient: string;
   owner: string;
   ownerChainId: string;
-}) {
+}): Promise<{ nonce: string }> {
   if (
     !params.depositChainId ||
     !params.depositTransactionId ||
@@ -79,6 +80,20 @@ export async function validateRecoverMode(params: {
   if (params.order.inputs.length !== 1) {
     throw externalError("recoverMode only supports single-input orders");
   }
+
+  // The withdrawal must move the deposit's own funds, so it settles on the
+  // chain the deposit was made on.
+  if (params.chainId !== params.depositChainId) {
+    throw externalError("Withdrawal chain does not match the deposit chain");
+  }
+
+  // A caller-chosen nonce would let one deposit authorize an unbounded number
+  // of withdrawals, so the oracle derives it instead. Every replay of the same
+  // recovery collapses onto one withdraw request hash for the Hub to reject.
+  const nonce = getDeterministicId(
+    params.depositOnchainId,
+    "recover-withdrawal",
+  );
 
   // Fetch deposit from chain
   const { messages: deposits } =
@@ -131,6 +146,17 @@ export async function validateRecoverMode(params: {
     );
   }
 
+  // The refund entry above is authored by the solver, so matching it alone does
+  // not tie the withdrawal to the deposited asset.
+  if (
+    encodedCurrency !==
+    encodeAddressToHex(deposit.result.currency, refundVmType)
+  ) {
+    throw externalError(
+      "Withdrawal currency does not match the deposit currency",
+    );
+  }
+
   // Owner / depositor cross-check
   if (params.ownerChainId !== params.depositChainId) {
     throw externalError("Owner chain does not match the deposit chain");
@@ -142,4 +168,17 @@ export async function validateRecoverMode(params: {
   ) {
     throw externalError("Owner does not match the deposit's depositor");
   }
+
+  // A slow refund returns the deposit to the address that made it. The refund
+  // entry matched above is authored by the solver, so it cannot be what decides
+  // where the funds land — otherwise anyone able to name a depositor could name
+  // themselves as the payee.
+  if (
+    encodeAddressToHex(params.recipient, refundVmType) !==
+    encodeAddressToHex(deposit.result.depositor, refundVmType)
+  ) {
+    throw externalError("Recipient is not the deposit's depositor");
+  }
+
+  return { nonce };
 }

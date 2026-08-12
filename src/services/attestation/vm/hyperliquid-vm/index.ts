@@ -2,7 +2,6 @@ import * as hl from "@nktkas/hyperliquid";
 import {
   DecodedHyperliquidVmWithdrawal,
   decodeWithdrawal,
-  DenormalizedSubmitWithdrawRequest,
   DepositoryWithdrawalMessage,
   DepositoryWithdrawalStatus,
   generateAddress,
@@ -12,7 +11,6 @@ import {
 } from "@relay-protocol/settlement-sdk";
 import axios from "axios";
 import {
-  parseUnits,
   hashStruct,
   zeroHash,
   getContract,
@@ -25,11 +23,7 @@ import {
 import { getDeterministicId } from "../../utils";
 import { EnhancedDepositoryDepositMessage, VmAttestor } from "../../vm/types";
 import { TxHints } from "../../../attestation";
-import {
-  getChain,
-  getChainVmType,
-  getHubInfo,
-} from "../../../../common/chains";
+import { getChain, getHubInfo } from "../../../../common/chains";
 import { externalError, internalError } from "../../../../common/error";
 import { httpRpc } from "../../../../common/vm/hyperliquid-vm/rpc";
 import { getHubHttpRpc as hubHttpRpc } from "../../../../common/hub";
@@ -38,7 +32,33 @@ import { logger } from "../../../../common/logger";
 
 const VM_TYPE = "hyperliquid-vm";
 
+const TX_ID_REGEX = /^0x[0-9a-f]{64}$/;
+
 const SPOT_USDC = "0x6d1e7cde53ba9467b783cb7c530ce054";
+
+const HYPERLIQUID_MAX_NONCE_PAST_AGE_MS = 2 * 24 * 3600 * 1000;
+const HYPERLIQUID_MAX_NONCE_FUTURE_AGE_MS = 24 * 3600 * 1000;
+const HYPERLIQUID_EXPIRY_SETTLEMENT_BUFFER_MS = 5 * 60 * 1000;
+
+export const parseDecimalUnits = (
+  amount: string | number,
+  decimals: number,
+): bigint => {
+  const value = String(amount).trim();
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    throw externalError(`Invalid decimal amount: ${value}`);
+  }
+
+  const [integerPart, fractionalPart = ""] = value.split(".");
+  const normalizedIntegerPart = integerPart.replace(/^0+(?=\d)/, "") || "0";
+  // Some currencies are handled with limited precision because the Hyperliquid
+  // team continuously upgrades their supported decimal precision.
+  const paddedFractionalPart = fractionalPart
+    .slice(0, decimals)
+    .padEnd(decimals, "0");
+
+  return BigInt(`${normalizedIntegerPart}${paddedFractionalPart}` || "0");
+};
 
 const getTxDetailsWithFallback = async (
   chainId: string,
@@ -155,6 +175,8 @@ export class HyperliquidVmAttestor extends VmAttestor {
   ): Promise<EnhancedDepositoryDepositMessage[]> {
     const trackingId = getTrackingId();
 
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
 
     // Get transaction details
@@ -216,10 +238,7 @@ export class HyperliquidVmAttestor extends VmAttestor {
               depositId: nonceMapping?.id ?? zeroHash,
               depositor: nonceMapping?.depositor ?? sender,
               currency: getVmTypeNativeCurrency(VM_TYPE),
-              amount: parseUnits(
-                Number(action.amount).toFixed(8),
-                8,
-              ).toString(),
+              amount: parseDecimalUnits(action.amount, 8).toString(),
             },
             extraData: {
               timestamp,
@@ -290,8 +309,8 @@ export class HyperliquidVmAttestor extends VmAttestor {
               depositId: nonceMapping?.id ?? zeroHash,
               depositor: nonceMapping?.depositor ?? sender,
               currency,
-              amount: parseUnits(
-                Number(action.amount).toFixed(currencyDecimals),
+              amount: parseDecimalUnits(
+                action.amount,
                 currencyDecimals,
               ).toString(),
             },
@@ -317,6 +336,10 @@ export class HyperliquidVmAttestor extends VmAttestor {
     transactionId?: string,
   ): Promise<DepositoryWithdrawalMessage> {
     const trackingId = getTrackingId();
+
+    if (transactionId !== undefined) {
+      this._requireCanonicalTransactionId(transactionId);
+    }
 
     const chain = await getChain(chainId);
 
@@ -399,24 +422,32 @@ export class HyperliquidVmAttestor extends VmAttestor {
       }
     }
 
-    // Past HL's 2-day nonce window it can't be submitted anymore, but we can't
-    // tell if it already executed and scrolled out — so surface it, never auto-expire.
+    // Scan the complete ledger range in which the withdrawal could have executed before deciding that it expired
     if (status === DepositoryWithdrawalStatus.PENDING) {
       const { parameters } = decodedWithdrawal.withdrawal;
       const withdrawalNonce =
         parameters.type === "SendAsset"
           ? Number(parameters.nonce)
           : Number(parameters.time);
+      const safeExpirationTime =
+        withdrawalNonce +
+        HYPERLIQUID_MAX_NONCE_PAST_AGE_MS +
+        HYPERLIQUID_EXPIRY_SETTLEMENT_BUFFER_MS;
+
+      // Allow transactions accepted near the nonce boundary to reach the ledger before relying on their absence.
       // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets#hyperliquid-nonces
-      if (withdrawalNonce < Date.now() - 2 * 24 * 3600 * 1000) {
-        logger.warn(
-          "hyperliquid-vm",
-          JSON.stringify({
-            msg: "Withdrawal past the 2-day nonce window but not found on-chain; not auto-expiring, needs manual review",
-            withdrawalId,
-            withdrawalNonce,
-          }),
+      if (Date.now() > safeExpirationTime) {
+        const result = await this._findWithdrawalInLedger(
+          chainId,
+          decodedWithdrawal,
+          trackingId,
         );
+        if (result) {
+          status = result.status;
+          withdrawalDepository = result.depository;
+        } else {
+          status = DepositoryWithdrawalStatus.EXPIRED;
+        }
       }
     }
 
@@ -446,6 +477,8 @@ export class HyperliquidVmAttestor extends VmAttestor {
     hints?: TxHints,
   ): Promise<bigint> {
     const trackingId = getTrackingId();
+
+    this._requireCanonicalTransactionId(transactionId);
 
     const rpc = await httpRpc(chainId);
 
@@ -509,7 +542,7 @@ export class HyperliquidVmAttestor extends VmAttestor {
           txParameters.destination.toLowerCase() ===
             payment.recipient.toLowerCase()
         ) {
-          return parseUnits(Number(txParameters.amount).toFixed(8), 8);
+          return parseDecimalUnits(txParameters.amount, 8);
         }
       } else if (txDetails.action.type === "usdSend") {
         const txParameters =
@@ -518,7 +551,7 @@ export class HyperliquidVmAttestor extends VmAttestor {
           txParameters.destination.toLowerCase() ===
           payment.recipient.toLowerCase()
         ) {
-          return parseUnits(Number(txParameters.amount).toFixed(8), 8);
+          return parseDecimalUnits(txParameters.amount, 8);
         }
       }
 
@@ -558,10 +591,7 @@ export class HyperliquidVmAttestor extends VmAttestor {
             throw externalError("Could not retrieve payment currency decimals");
           }
 
-          return parseUnits(
-            Number(txParameters.amount).toFixed(currencyDecimals),
-            currencyDecimals,
-          );
+          return parseDecimalUnits(txParameters.amount, currencyDecimals);
         }
       }
 
@@ -577,20 +607,100 @@ export class HyperliquidVmAttestor extends VmAttestor {
     throw internalError("Not implemented (verifySolverCalls)");
   }
 
-  public async validateSubmitWithdrawRequest(
-    data: DenormalizedSubmitWithdrawRequest,
-  ): Promise<boolean> {
-    const vmType = await getChainVmType(data.chainId);
+  private async _findWithdrawalInLedger(
+    chainId: string,
+    decodedWithdrawal: DecodedHyperliquidVmWithdrawal,
+    trackingId: string,
+  ): Promise<
+    { status: DepositoryWithdrawalStatus; depository: string } | undefined
+  > {
+    const chain = await getChain(chainId);
+    const depository = chain.depository;
+    if (!depository) {
+      throw externalError("Chain has no depository configured");
+    }
 
-    const isNativeCurrency = data.currency === getVmTypeNativeCurrency(vmType);
-    if (!isNativeCurrency) {
-      const additionalData = data.additionalData?.["hyperliquid-vm"];
-      if (!additionalData) {
-        return false;
+    const depositories = [depository, ...(chain.additionalDepositories ?? [])];
+    const withdrawalId = getDecodedWithdrawalId(decodedWithdrawal);
+    const rpc = await httpRpc(chainId);
+    const { parameters } = decodedWithdrawal.withdrawal;
+    const withdrawalNonce =
+      parameters.type === "SendAsset"
+        ? Number(parameters.nonce)
+        : Number(parameters.time);
+
+    // T - maxAgePast < nonce < T + maxAgeFuture
+    const firstPossibleExecutionTime =
+      withdrawalNonce - HYPERLIQUID_MAX_NONCE_FUTURE_AGE_MS;
+    const lastPossibleExecutionTime =
+      withdrawalNonce + HYPERLIQUID_MAX_NONCE_PAST_AGE_MS;
+
+    for (const currentDepository of depositories) {
+      let startTime = firstPossibleExecutionTime;
+      while (startTime <= lastPossibleExecutionTime) {
+        await logRpcUsage(chainId, "userNonFundingLedgerUpdates", trackingId);
+        const ledgerUpdates = await rpc.userNonFundingLedgerUpdates({
+          user: currentDepository as `0x${string}`,
+          startTime,
+          endTime: lastPossibleExecutionTime,
+        });
+
+        for (const update of ledgerUpdates) {
+          const delta = update.delta as any;
+          if (delta.user?.toLowerCase() !== currentDepository.toLowerCase()) {
+            continue;
+          }
+
+          const isCandidate =
+            (parameters.type === "SendAsset" &&
+              delta.type === "send" &&
+              Number(delta.nonce) === withdrawalNonce) ||
+            (parameters.type === "UsdSend" &&
+              delta.type === "internalTransfer" &&
+              // We use $2 as the delta which will trigger a transaction data retrieval
+              Math.abs(Number(delta.usdc) - Number(parameters.amount)) <= 2);
+          if (isCandidate) {
+            const txDetails = await getTxDetailsWithFallback(
+              chainId,
+              update.hash,
+              trackingId,
+            );
+            const txMessageHash = this._getMessageHash(txDetails.action);
+            if (txMessageHash && withdrawalId === txMessageHash) {
+              if (!txDetails.error) {
+                return {
+                  status: DepositoryWithdrawalStatus.EXECUTED,
+                  depository: currentDepository,
+                };
+              } else {
+                return {
+                  status: DepositoryWithdrawalStatus.EXPIRED,
+                  depository: currentDepository,
+                };
+              }
+            }
+          }
+        }
+
+        if (!ledgerUpdates.length) {
+          break;
+        }
+
+        const lastUpdateTime = Math.max(
+          ...ledgerUpdates.map((update) => update.time),
+        );
+        if (
+          lastUpdateTime <= startTime ||
+          lastUpdateTime >= lastPossibleExecutionTime
+        ) {
+          break;
+        }
+
+        startTime = lastUpdateTime;
       }
     }
 
-    return true;
+    return undefined;
   }
 
   private async _lookupDepositId(
@@ -687,6 +797,15 @@ export class HyperliquidVmAttestor extends VmAttestor {
     }
 
     return { id: data };
+  }
+
+  // Validate the transaction id against Hyperliquid's canonical hash format.
+  private _requireCanonicalTransactionId(transactionId: string) {
+    if (!TX_ID_REGEX.test(transactionId)) {
+      throw externalError(
+        `Invalid hyperliquid-vm transaction id ${transactionId}: expected 0x + 64 lowercase hex chars`,
+      );
+    }
   }
 
   private _getMessageHash(action: any): string | undefined {

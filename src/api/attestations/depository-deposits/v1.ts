@@ -1,17 +1,14 @@
 import { Type } from "@fastify/type-provider-typebox";
 
 import {
-  areExecutionsEqual,
-  filterSignaturesByDomain,
   Endpoint,
   ErrorResponses,
   executionSchema,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import { signExecutionMessage } from "../../../common/signer";
-import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
 
 const MessageData = Type.Object({
@@ -21,12 +18,6 @@ const MessageData = Type.Object({
   transactionId: Type.String({
     description: "The transaction id to attest",
   }),
-  mode: Type.Optional(
-    Type.Union([Type.Literal("fast"), Type.Literal("slow")], {
-      description:
-        "Attestation mode (default slow): 'slow' waits for full finalization, 'fast' might not wait for full finalization (depending on the oracle's configuration)",
-    }),
-  ),
   hints: Type.Optional(
     Type.Object(
       {
@@ -103,46 +94,35 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const attestationService = new AttestationService();
-    const { messages, execution } =
-      await attestationService.attestDepositoryDeposits(req.body);
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          // Fastify keeps unknown body fields, so forward picked fields only.
+          // This prevents callers from smuggling mode=fast into this endpoint.
+          const { messages, execution } =
+            await new AttestationService().attestDepositoryDeposits({
+              chainId: req.body.chainId,
+              transactionId: req.body.transactionId,
+              hints: req.body.hints,
+            });
+          const localSignature = execution
+            ? await signExecutionMessage(execution)
+            : undefined;
 
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (areExecutionsEqual(peerData.execution, execution)) {
-                return peerData.execution.signatures;
-              }
-
-              return [];
-            },
-          })
-        : [];
-
-    const localExecutionSignature = execution
-      ? await signExecutionMessage(execution)
-      : undefined;
-
-    return reply.send({
-      messages,
-      execution:
-        execution && localExecutionSignature
-          ? {
-              ...execution,
-              signatures: [
-                localExecutionSignature,
-                ...filterSignaturesByDomain(
-                  peerSignatures,
-                  localExecutionSignature,
-                  { chainId: "oracleChainId", contract: "oracleContract" },
-                ),
-              ],
-            }
-          : undefined,
-    });
+          return {
+            messages,
+            execution:
+              execution && localSignature
+                ? { ...execution, signatures: [localSignature] }
+                : undefined,
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

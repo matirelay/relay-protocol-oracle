@@ -1,5 +1,13 @@
-import { describe, expect, it, jest, beforeEach } from "@jest/globals";
 import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from "@jest/globals";
+import {
+  zeroAddress,
   zeroHash,
   keccak256,
   encodePacked,
@@ -7,6 +15,7 @@ import {
   verifyTypedData,
   verifyMessage,
   encodeAbiParameters,
+  parseAbiParameters,
 } from "viem";
 
 import { AttestationService } from "../../../../src/services/attestation";
@@ -28,6 +37,7 @@ import {
   getNoFillOrRefundMessage,
   getNonceMappingMessage,
   getWithdrawRequestHash,
+  encodeWithdrawRequestAdditionalData,
   normalizeWithdrawRequest,
   SolverFillStatus,
   SolverRefundStatus,
@@ -37,10 +47,17 @@ import {
 import {
   Chain,
   getChainVmType,
+  getHubInfo,
   getSdkChainsConfig,
 } from "../../../../src/common/chains";
 import { createMockWithdrawalAddressRequest } from "../../../common/withdrawals";
-import { getBalanceOnHub, getHubHttpRpc } from "../../../../src/common/hub";
+import {
+  getBalanceOnHub,
+  getHubBatchHttpRpc,
+  getHubHttpRpc,
+} from "../../../../src/common/hub";
+import { httpRpc as getEthereumVmRpc } from "../../../../src/common/vm/ethereum-vm/rpc";
+import { FeeCommitment } from "../../../../src/services/attestation/fee-commitment";
 import { getAddress } from "viem";
 
 // default vars
@@ -51,12 +68,27 @@ const solanaDepositoryAddress = "FcdAmYWSixzyEGHaPQmDWXzyVFbiKEU2f4MuJfkLKH3u";
 
 jest.mock("../../../../src/services/attestation/vm");
 jest.mock("../../../../src/common/chains");
+// The fee commitment signature is verified against the payer's source chain
+jest.mock("../../../../src/common/vm/ethereum-vm/rpc", () => ({
+  httpRpc: jest.fn().mockImplementation(() =>
+    Promise.resolve({
+      verifyTypedData: jest
+        .fn()
+        .mockImplementation(() => Promise.resolve(true)),
+    }),
+  ),
+}));
 jest.mock("../../../../src/common/hub", () => ({
   getBalanceOnHub: jest.fn().mockImplementation(() => Promise.resolve(10000n)),
   getHubHttpRpc: jest.fn().mockImplementation(() =>
     Promise.resolve({
       readContract: jest.fn(),
       getBlock: jest.fn(),
+    }),
+  ),
+  getHubBatchHttpRpc: jest.fn().mockImplementation(() =>
+    Promise.resolve({
+      readContract: jest.fn(),
     }),
   ),
 }));
@@ -78,10 +110,14 @@ jest.mock("../../../../src/common/chains", () => {
       vmType: "ethereum-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "0x0987654321098765432109876543210987654321",
-      hubChainId: "1",
       additionalData: {
+        evmChainId: "1",
         fastMode: {
           feeRecipient: "0x00000000000000000000000000000000000000fe",
+          feeCurrency: {
+            chainId: "ethereum",
+            currency: "0x00000000000000000000000000000000000000cf",
+          },
           finalityTiers: {
             "0x1111111111111111111111111111111111111111": [
               {
@@ -96,20 +132,49 @@ jest.mock("../../../../src/common/chains", () => {
         },
       },
     },
+    polygon: {
+      id: "polygon",
+      vmType: "ethereum-vm",
+      httpRpcUrl: "http://127.0.0.1:8545",
+      depository: "0x0987654321098765432109876543210987654321",
+      additionalData: { evmChainId: "137" },
+    },
+    "polygon-gateway": {
+      id: "polygon-gateway",
+      vmType: "gateway-vm",
+      httpRpcUrl: "",
+      gateway: {
+        source: {
+          id: "polygon",
+          gatewayDepository: "0x2222222222222222222222222222222222222222",
+          usdc: "0x1111111111111111111111111111111111111111",
+          circleDomain: 7,
+          blockTimeSeconds: 2,
+          withdrawalDelaySeconds: 604800,
+          executionExpirationSeconds: 864000,
+          maxBlockHeightTolerance: 500,
+        },
+        destinations: [
+          {
+            id: "polygon",
+            gatewayDepository: "0x3333333333333333333333333333333333333333",
+            usdc: "0x1111111111111111111111111111111111111111",
+            circleDomain: 7,
+          },
+        ],
+      },
+    },
     solana: {
       id: "solana",
       vmType: "solana-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "FcdAmYWSixzyEGHaPQmDWXzyVFbiKEU2f4MuJfkLKH3u",
-      hubChainId:
-        "50176979118388105370421134508366610418687875236156196470082648173271157915018",
     },
     hyperliquid: {
       id: "hyperliquid",
       vmType: "hyperliquid-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "0x0987654321098765432109876543210987654321",
-      hubChainId: "1",
     },
     ton: {
       id: "ton",
@@ -117,7 +182,6 @@ jest.mock("../../../../src/common/chains", () => {
       httpRpcUrl: "http://127.0.0.1:8545",
       depository:
         "0:f37b9f6fd97ece249cb48d9aa5d0202570ad130b7b7d4ce4dd0f4cd551b3d9bd",
-      hubChainId: "1",
     },
     lighter: {
       id: "lighter",
@@ -125,7 +189,6 @@ jest.mock("../../../../src/common/chains", () => {
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "460491",
       additionalDepositories: ["460492"],
-      hubChainId: "1",
     },
   };
   return {
@@ -133,6 +196,8 @@ jest.mock("../../../../src/common/chains", () => {
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: jest.fn().mockImplementation(async (chainId) => {
       if (chainId === "ethereum") return "ethereum-vm";
+      if (chainId === "polygon") return "ethereum-vm";
+      if (chainId === "polygon-gateway") return "gateway-vm";
       if (chainId === "solana") return "solana-vm";
       if (chainId === "hyperliquid-vm") return "hyperliquid-vm";
       if (chainId === "base") return "ethereum-vm";
@@ -141,42 +206,59 @@ jest.mock("../../../../src/common/chains", () => {
       if (chainId === "lighter") return "lighter-vm";
       throw new Error(`Unknown chain: ${chainId}`);
     }),
-    getChainHubChainId: jest.fn().mockImplementation(async (chainId) => {
-      if (chainId === "ethereum") return 1;
-      if (chainId === "solana") return 101;
-      if (chainId === "hyperliquid-vm") return 1;
-      if (chainId === "base") return 8543;
-      if (chainId === "lighter") return 1;
-      throw new Error(`Unknown chain: ${chainId}`);
-    }),
     getHubInfo: jest.fn().mockImplementation(async () => ({
       id: "hub",
       evmChainId: "1",
       httpRpcUrl: "http://localhost:8545",
       hubAddress: "0x0000000000000000000000000000000000000001",
       oracleAddress: "0x0000000000000000000000000000000000000002",
+      oracleVersion: "2",
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
       allocatorAddress: "0x0000000000000000000000000000000000000005",
       executorAddress: "0x0000000000000000000000000000000000000009",
       depositAddressManagerAddress:
         "0x0000000000000000000000000000000000000008",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress:
-        "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
       rateLimiter: {
         address: "0x00000000000000000000000000000000000000aa",
         type: "amount",
+      },
+      feeCalculator: {
+        address: "0x00000000000000000000000000000000000000cc",
+        type: "bps",
       },
     })),
     RELAY_CHAIN_ID: "relay",
     getSdkChainsConfig: jest.fn(() => ({
       ethereum: "ethereum-vm",
+      polygon: "ethereum-vm",
+      "polygon-gateway": "gateway-vm",
       solana: "solana-vm",
     })),
+    getGatewaySource: jest.fn().mockImplementation(async (gatewayChain: Chain) => {
+      const source = gatewayChain.gateway?.source;
+      if (!source) {
+        throw new Error("Gateway chain has no source");
+      }
+      return {
+        ...source,
+        chain: chains[source.id],
+      };
+    }),
+    getGatewayDestination: jest
+      .fn()
+      .mockImplementation(async (gatewayChain: Chain, destinationChainId) => {
+        const destination = gatewayChain.gateway?.destinations.find(
+          (candidate: { id: string }) => candidate.id === destinationChainId,
+        );
+        if (!destination) {
+          throw new Error("Gateway destination not configured");
+        }
+        return {
+          ...destination,
+          chain: chains[destination.id],
+        };
+      }),
   };
 });
 
@@ -184,6 +266,11 @@ const mockGetVmAttestor = jest.mocked(getVmAttestor);
 
 describe("AttestationService", () => {
   const service = new AttestationService();
+  const mockExecutorFeesCharged = (feesCharged: boolean) => {
+    const readContract = jest.fn<any>().mockResolvedValue(feesCharged);
+    jest.mocked(getHubHttpRpc).mockResolvedValue({ readContract } as any);
+    return readContract;
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -268,43 +355,86 @@ describe("AttestationService", () => {
       depositId:
         "0x0000000000000000000000000000000000000000000000000000000000000789",
     };
-    const fastAttestorMock = () => ({
-      getDepositoryDepositMessages: jest.fn().mockImplementation(() =>
-        Promise.resolve([
-          {
-            data: { chainId: "ethereum", transactionId: FAST_TX_ID },
-            result: fastDepositResult,
-            extraData: {
-              timestamp: "1234567890",
-              mode: "fast",
-              fastFeeBps: "10000000000000000",
-            },
-          },
-        ]),
-      ),
-    });
-    // Stub the hub read the fast pre-check makes (canConsume): within budget / over budget / read error.
-    const mockCanConsume = (outcome: "ok" | "reject" | "error") => {
+    // Mock the VM attestor returning the given fast deposits
+    const mockFastDeposits = (
+      deposits: { fastFeeBps: string; amount?: string; currency?: string }[],
+    ) =>
+      mockGetVmAttestor.mockResolvedValue({
+        getDepositoryDepositMessages: jest.fn().mockImplementation(() =>
+          Promise.resolve(
+            deposits.map(({ fastFeeBps, amount, currency }) => ({
+              data: { chainId: "ethereum", transactionId: FAST_TX_ID },
+              result: {
+                ...fastDepositResult,
+                ...(amount ? { amount } : {}),
+                ...(currency ? { currency } : {}),
+              },
+              extraData: { timestamp: "1234567890", mode: "fast", fastFeeBps },
+            })),
+          ),
+        ),
+      } as any);
+    const FEE_BPS = "10000000000000000"; // 1%
+    // Stub the hub reads the fast pre-checks make: canConsume (within budget /
+    // over budget / read error) and the commitment signature verification.
+    const mockHubRpc = (opts?: {
+      canConsume?: "ok" | "reject" | "error" | ((args: any[]) => boolean);
+      validSignature?: boolean;
+    }) => {
       const readContract = jest.fn<any>();
-      if (outcome === "error") {
+      const canConsume = opts?.canConsume ?? "ok";
+      if (canConsume === "error") {
         readContract.mockRejectedValue(new Error("rpc down"));
+      } else if (typeof canConsume === "function") {
+        readContract.mockImplementation(({ args }: any) =>
+          Promise.resolve(canConsume(args)),
+        );
       } else {
-        readContract.mockResolvedValue(outcome === "ok");
+        readContract.mockResolvedValue(canConsume === "ok");
       }
+
       jest.mocked(getHubHttpRpc).mockResolvedValue({
         readContract,
         getBlock: jest.fn(),
       } as any);
+      jest.mocked(getEthereumVmRpc).mockResolvedValue({
+        verifyTypedData: jest
+          .fn<any>()
+          .mockResolvedValue(opts?.validSignature ?? true),
+      } as any);
+
+      return { readContract };
     };
 
-    it(`emits FAST_MINT for a fast-applied deposit`, async () => {
-      mockGetVmAttestor.mockResolvedValue(fastAttestorMock() as any);
-      mockCanConsume("ok"); // within budget
+    const FEE_CURRENCY = "0x00000000000000000000000000000000000000cf";
 
+    const validCommitment = (overrides?: {
+      fee?: Partial<FeeCommitment["fee"]>;
+    }) => ({
+      payer: {
+        chainId: "ethereum",
+        address: "0x00000000000000000000000000000000000000ee",
+      },
+      fee: {
+        chainId: "ethereum",
+        currency: FEE_CURRENCY,
+        maxAmount: "100",
+        ...overrides?.fee,
+      },
+      deadline: String(Math.floor(Date.now() / 1000) + 3600),
+      signature: "0xdeadbeef",
+    });
+
+    it(`emits FAST_MINT with the configured fee calculator for a committed fast deposit`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc(); // within budget, valid signature
+
+      const commitment = validCommitment();
       const result = await service.attestDepositoryDeposits({
         chainId: "ethereum",
         transactionId: FAST_TX_ID,
         mode: "fast",
+        feeCommitment: commitment,
       });
 
       expect(result.messages[0].extraData.mode).toBe("fast");
@@ -320,24 +450,47 @@ describe("AttestationService", () => {
           family: await getChainVmType("ethereum"),
         }),
       );
+      expect(getAddress(decoded.data.feeCalculator)).toBe(
+        getAddress("0x00000000000000000000000000000000000000cc"),
+      );
+      // RelayBpsFeeCalculator data: (feeCurrency, feeBps, maxFeeAmount, feeRecipient, feePayer)
+      expect(decoded.data.feeCalculatorData).toBe(
+        encodeAbiParameters(
+          parseAbiParameters(
+            "uint256 feeCurrency, uint256 feeBps, uint256 maxFeeAmount, address feeRecipient, address feePayer",
+          ),
+          [
+            generateTokenId({
+              address: FEE_CURRENCY,
+              chainId: "ethereum",
+              family: "ethereum-vm",
+            }),
+            10000000000000000n,
+            100n,
+            "0x00000000000000000000000000000000000000fe",
+            // The fee is charged from the payer's hub alias, not its raw address
+            generateAddress({
+              address: commitment.payer.address,
+              chainId: "ethereum",
+              family: "ethereum-vm",
+            }),
+          ],
+        ),
+      );
       expect(getAddress(decoded.data.rateLimiter)).toBe(
         getAddress("0x00000000000000000000000000000000000000aa"),
       );
       expect(decoded.data.rateLimiterData).toBe("0x");
-      expect(getAddress(decoded.data.feeCalculator)).toBe(
-        getAddress("0x0000000000000000000000000000000000000000"),
-      );
-      expect(decoded.data.feeCalculatorData).toBe("0x");
       expect(getAddress(decoded.data.hubToAddress)).toBe(
         getAddress("0x5dCC0A25a0170DB4D7A4E634b6D416d41717553a"),
       );
-      // The attested amount stays gross (1010); the contract splits the fee on-chain — we don't rewrite it.
+      // The attested amount stays gross (1010); the fee is charged on top of it on-chain.
       expect(result.messages[0].result.amount).toBe("1010");
     });
 
-    it(`throws (retry-slow) when the rate-limit pre-check rejects a fast deposit`, async () => {
-      mockGetVmAttestor.mockResolvedValue(fastAttestorMock() as any);
-      mockCanConsume("reject"); // bucket over budget → caller re-requests slow
+    it(`rejects a fee-bearing fast deposit without a fee commitment`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc();
 
       await expect(
         service.attestDepositoryDeposits({
@@ -345,21 +498,284 @@ describe("AttestationService", () => {
           transactionId: FAST_TX_ID,
           mode: "fast",
         }),
-      ).rejects.toThrow(/rate limit/i);
+      ).rejects.toThrow(/requires a fee commitment/i);
     });
 
-    it(`fails open (still emits FAST_MINT) when the rate-limit pre-check read errors`, async () => {
-      mockGetVmAttestor.mockResolvedValue(fastAttestorMock() as any);
-      mockCanConsume("error"); // RPC blip → fail open
+    it(`rejects a fee-bearing fast deposit with an invalid commitment signature`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc({ validSignature: false });
+
+      await expect(
+        service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+          feeCommitment: validCommitment(),
+        }),
+      ).rejects.toThrow(/invalid fee commitment signature/i);
+    });
+
+    it(`rejects a commitment over a different fee currency`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc();
+
+      await expect(
+        service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+          feeCommitment: validCommitment({
+            fee: { currency: "0x00000000000000000000000000000000000000dd" },
+          }),
+        }),
+      ).rejects.toThrow(/does not match the configured fee currency/i);
+    });
+
+    it(`emits a fee-free FAST_MINT without requiring a commitment when the tier fee is zero`, async () => {
+      mockFastDeposits([{ fastFeeBps: "0" }]);
+      mockHubRpc();
 
       const result = await service.attestDepositoryDeposits({
         chainId: "ethereum",
         transactionId: FAST_TX_ID,
         mode: "fast",
       });
+
+      const decoded = decodeAction(result.execution!.actions[0]) as any;
+      expect(decoded.type).toBe(ActionType.FAST_MINT);
+      expect(decoded.data.feeCalculator).toBe(zeroAddress);
+      expect(decoded.data.feeCalculatorData).toBe("0x");
+      expect(getAddress(decoded.data.rateLimiter)).toBe(
+        getAddress("0x00000000000000000000000000000000000000aa"),
+      );
+    });
+
+    it(`mixed zero/non-zero fee tiers in one tx: fee-free legs get a zero calculator, fee legs the configured one`, async () => {
+      mockFastDeposits([{ fastFeeBps: "0" }, { fastFeeBps: FEE_BPS }]);
+      mockHubRpc();
+
+      const result = await service.attestDepositoryDeposits({
+        chainId: "ethereum",
+        transactionId: FAST_TX_ID,
+        mode: "fast",
+        feeCommitment: validCommitment(),
+      });
+
+      const [freeLeg, feeLeg] = result.execution!.actions.map(
+        (a) => decodeAction(a) as any,
+      );
+      expect(freeLeg.data.feeCalculator).toBe(zeroAddress);
+      expect(freeLeg.data.feeCalculatorData).toBe("0x");
+      expect(getAddress(feeLeg.data.feeCalculator)).toBe(
+        getAddress("0x00000000000000000000000000000000000000cc"),
+      );
+      expect(feeLeg.data.feeCalculatorData).not.toBe("0x");
+    });
+
+    it(`rejects a tx whose fast deposits resolve to different non-zero fee tiers`, async () => {
+      mockFastDeposits([
+        { fastFeeBps: FEE_BPS },
+        { fastFeeBps: "20000000000000000" },
+      ]);
+      mockHubRpc();
+
+      await expect(
+        service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+          feeCommitment: validCommitment(),
+        }),
+      ).rejects.toThrow(/fee tiers differ/i);
+    });
+
+    it(`sums the rate-limiter budget per token id, not across currencies`, async () => {
+      mockFastDeposits([
+        { fastFeeBps: "0", amount: "600" },
+        {
+          fastFeeBps: "0",
+          amount: "600",
+          currency: "0x2222222222222222222222222222222222222222",
+        },
+      ]);
+      const { readContract } = mockHubRpc({
+        canConsume: (args) => (args[1] as bigint) <= 1000n,
+      });
+
+      // 600 + 600 across two different currencies → two per-token checks, both within budget
+      const result = await service.attestDepositoryDeposits({
+        chainId: "ethereum",
+        transactionId: FAST_TX_ID,
+        mode: "fast",
+      });
+      expect(result.execution?.actions.length).toBe(2);
+      expect(readContract).toHaveBeenCalledTimes(2);
+      const checkedTokenIds = readContract.mock.calls.map(
+        (c: any[]) => c[0].args[0],
+      );
+      expect(new Set(checkedTokenIds).size).toBe(2);
+    });
+
+    it(`throws (retry-slow) when the rate-limit pre-check rejects a fast deposit`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc({ canConsume: "reject" }); // bucket over budget → caller re-requests slow
+
+      await expect(
+        service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+          feeCommitment: validCommitment(),
+        }),
+      ).rejects.toThrow(/rate limit/i);
+    });
+
+    it(`checks the rate-limiter budget on the summed amount across the tx's deposits`, async () => {
+      // Two deposits of the same currency: each fits a 1000 budget, together they don't
+      mockFastDeposits([
+        { fastFeeBps: FEE_BPS, amount: "600" },
+        { fastFeeBps: FEE_BPS, amount: "600" },
+      ]);
+      const { readContract } = mockHubRpc({
+        canConsume: (args) => (args[1] as bigint) <= 1000n,
+      });
+
+      await expect(
+        service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+          feeCommitment: validCommitment(),
+        }),
+      ).rejects.toThrow(/rate limit/i);
+      // One summed check (1200), not two per-message checks
+      expect(readContract).toHaveBeenCalledTimes(1);
+      expect(readContract.mock.calls[0][0]).toMatchObject({
+        functionName: "canConsume",
+      });
+      expect((readContract.mock.calls[0][0] as any).args[1]).toBe(1200n);
+    });
+
+    it(`fails open (still emits FAST_MINT) when the rate-limit pre-check read errors`, async () => {
+      mockFastDeposits([{ fastFeeBps: FEE_BPS }]);
+      mockHubRpc({ canConsume: "error" }); // RPC blip → fail open
+
+      const result = await service.attestDepositoryDeposits({
+        chainId: "ethereum",
+        transactionId: FAST_TX_ID,
+        mode: "fast",
+        feeCommitment: validCommitment(),
+      });
       const [action] = result.execution?.actions || [];
       const decoded = decodeAction(action) as any;
       expect(decoded.type).toBe(ActionType.FAST_MINT);
+    });
+
+    // USD limiter variant: one per-chain bucket, one batched pre-check, fail-closed
+    describe("with the usd rate limiter", () => {
+      const USD_RATE_LIMITER = "0x00000000000000000000000000000000000000ab";
+      const defaultGetHubInfo = jest
+        .mocked(getHubInfo)
+        .getMockImplementation()!;
+
+      beforeEach(() => {
+        jest.mocked(getHubInfo).mockImplementation(async () => ({
+          ...(await defaultGetHubInfo()),
+          rateLimiter: { address: USD_RATE_LIMITER, type: "usd" as const },
+        }));
+      });
+      afterEach(() => {
+        jest.mocked(getHubInfo).mockImplementation(defaultGetHubInfo);
+      });
+
+      const CHAIN_ID_DATA = encodeAbiParameters(
+        parseAbiParameters("string chainId"),
+        ["ethereum"],
+      );
+
+      it(`pre-checks all deposits in one batched call and emits FAST_MINTs carrying the encoded chain id`, async () => {
+        mockFastDeposits([
+          { fastFeeBps: "0", amount: "600" },
+          { fastFeeBps: "0", amount: "600" },
+          {
+            fastFeeBps: "0",
+            amount: "700",
+            currency: "0x2222222222222222222222222222222222222222",
+          },
+        ]);
+        const { readContract } = mockHubRpc(); // within budget
+
+        const result = await service.attestDepositoryDeposits({
+          chainId: "ethereum",
+          transactionId: FAST_TX_ID,
+          mode: "fast",
+        });
+
+        // One batched call over every fast message, not per-token checks
+        expect(readContract).toHaveBeenCalledTimes(1);
+        expect(readContract.mock.calls[0][0]).toMatchObject({
+          functionName: "resolveCanConsumeBatch",
+        });
+        const [tokenIds, amounts, data] = (readContract.mock.calls[0][0] as any)
+          .args;
+        const defaultTokenId = generateTokenId({
+          address: fastDepositResult.currency,
+          chainId: "ethereum",
+          family: "ethereum-vm",
+        });
+        // Per-message entries, not per-token aggregates — the contract prices
+        // each entry the way the sequential per-action consume() calls will
+        expect(tokenIds).toEqual([
+          defaultTokenId,
+          defaultTokenId,
+          generateTokenId({
+            address: "0x2222222222222222222222222222222222222222",
+            chainId: "ethereum",
+            family: "ethereum-vm",
+          }),
+        ]);
+        expect(amounts).toEqual([600n, 600n, 700n]);
+        expect(data).toBe(CHAIN_ID_DATA);
+
+        // Each action names the usd limiter and the data its consume() decodes
+        expect(result.execution?.actions.length).toBe(3);
+        for (const action of result.execution?.actions || []) {
+          const decoded = decodeAction(action) as any;
+          expect(decoded.type).toBe(ActionType.FAST_MINT);
+          expect(getAddress(decoded.data.rateLimiter)).toBe(
+            getAddress(USD_RATE_LIMITER),
+          );
+          expect(decoded.data.rateLimiterData).toBe(CHAIN_ID_DATA);
+        }
+      });
+
+      it(`throws (retry-slow) when the batched pre-check rejects the tx`, async () => {
+        mockFastDeposits([{ fastFeeBps: "0" }]);
+        mockHubRpc({ canConsume: "reject" }); // per-chain bucket over budget
+
+        await expect(
+          service.attestDepositoryDeposits({
+            chainId: "ethereum",
+            transactionId: FAST_TX_ID,
+            mode: "fast",
+          }),
+        ).rejects.toThrow(/rate limit/i);
+      });
+
+      it(`fails closed (throws retry-slow) when the batched pre-check read errors`, async () => {
+        mockFastDeposits([{ fastFeeBps: "0" }]);
+        // A revert means the limiter cannot price the token — unlike the
+        // amount path, the deposit must not go fast
+        mockHubRpc({ canConsume: "error" });
+
+        await expect(
+          service.attestDepositoryDeposits({
+            chainId: "ethereum",
+            transactionId: FAST_TX_ID,
+            mode: "fast",
+          }),
+        ).rejects.toThrow(/rate limit/i);
+      });
     });
 
     it(`uses deposit chain to compute recipient address when depositId is zeroHash`, async () => {
@@ -457,6 +873,7 @@ describe("AttestationService", () => {
             {
               to: recipient,
               data: "0x",
+              dataHash: zeroHash,
               value: amount,
               allowFailure: false,
             },
@@ -571,6 +988,7 @@ describe("AttestationService", () => {
             {
               to: recipient,
               data: "0x",
+              dataHash: zeroHash,
               value: amount,
               allowFailure: false,
             },
@@ -794,6 +1212,24 @@ describe("AttestationService", () => {
       nonce:
         "0x0000000000000000000000000000000000000000000000000000000000000001",
     };
+    const gatewayWithdrawRequest = {
+      chainId: "polygon-gateway",
+      depository: "0x2222222222222222222222222222222222222222",
+      currency: zeroAddress,
+      amount: "1000",
+      spenderChainId: "relay",
+      spender: "0x0000000000000000000000000000000000000009",
+      receiver: "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+      nonce:
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+      additionalData: {
+        "gateway-vm": {
+          allocator: "0x0000000000000000000000000000000000000005",
+          destinationChainId: "polygon",
+          maxBlockHeight: "735450",
+        },
+      },
+    };
 
     it("mints an expired ton-vm withdrawal back to the native spender alias", async () => {
       // _getEncodedWithdrawalV3 reads: payloadBuilders -> family() -> payloads
@@ -959,6 +1395,74 @@ describe("AttestationService", () => {
         payload,
         undefined,
         undefined,
+      );
+    });
+
+    it("mints an expired Gateway withdrawal back under the logical Gateway token", async () => {
+      const payload = "0x1234";
+      const orderAddress = "0x0000000000000000000000000000000000000010";
+      const mockedHubRpc = {
+        readContract: jest
+          .fn<any>()
+          .mockResolvedValueOnce("0x1E501Cb130fac80b3CaD5145AbCbF7393B02C3a5")
+          .mockResolvedValueOnce("gateway-vm")
+          .mockResolvedValueOnce(payload)
+          .mockResolvedValueOnce(orderAddress),
+      };
+      jest.mocked(getHubHttpRpc).mockResolvedValue(mockedHubRpc as any);
+
+      const mockAttestor: any = {
+        getDepositoryWithdrawalMessage: jest.fn().mockImplementation(() =>
+          Promise.resolve({
+            data: {
+              chainId: "polygon-gateway",
+              withdrawal: payload,
+            },
+            result: {
+              withdrawalId: zeroHash,
+              depository:
+                "0x3333333333333333333333333333333333333333",
+              status: DepositoryWithdrawalStatus.EXPIRED,
+            },
+          }),
+        ),
+      };
+      mockGetVmAttestor.mockResolvedValue(mockAttestor);
+
+      const result = await service.attestDepositoryWithdrawalV3(
+        gatewayWithdrawRequest,
+      );
+
+      expect(result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+      expect(mockAttestor.getDepositoryWithdrawalMessage).toHaveBeenCalledWith(
+        "polygon-gateway",
+        payload,
+        undefined,
+        undefined,
+      );
+      const [action] = result.execution?.actions ?? [];
+      expect(decodeAction(action)).toEqual({
+        type: ActionType.MINT,
+        data: {
+          hubTokenId: generateTokenId({
+            address: zeroAddress,
+            chainId: "polygon-gateway",
+            family: "ethereum-vm",
+          }),
+          hubToAddress: orderAddress,
+          amount: gatewayWithdrawRequest.amount,
+        },
+      });
+    });
+
+    it("rejects a destination depository as the Gateway request depository", async () => {
+      await expect(
+        service.attestDepositoryWithdrawalV3({
+          ...gatewayWithdrawRequest,
+          depository: "0x3333333333333333333333333333333333333333",
+        }),
+      ).rejects.toThrow(
+        "Depository 0x3333333333333333333333333333333333333333 is not configured for chain polygon-gateway",
       );
     });
   });
@@ -1141,7 +1645,7 @@ describe("AttestationService", () => {
         domain: {
           name: "RelayNoFillOrRefund",
           version: "1",
-          chainId: 1, // hubChainId for "ethereum"
+          chainId: 1, // EVM chain ID for "ethereum"
           verifyingContract: "0x0000000000000000000000000000000000000000",
         },
         types: {
@@ -1278,7 +1782,9 @@ describe("AttestationService", () => {
           .mockResolvedValueOnce(hashesToSign[0])
           .mockResolvedValueOnce(hashesToSign[1]),
       };
-      jest.mocked(getHubHttpRpc).mockResolvedValueOnce(mockedHubRpc as any);
+      jest
+        .mocked(getHubBatchHttpRpc)
+        .mockResolvedValueOnce(mockedHubRpc as any);
 
       const result = await service.attestWithdrawRequest(withdrawRequestInput);
 
@@ -1301,11 +1807,69 @@ describe("AttestationService", () => {
       const mockedHubRpc = {
         readContract: jest.fn<any>().mockResolvedValueOnce(zeroHash),
       };
-      jest.mocked(getHubHttpRpc).mockResolvedValueOnce(mockedHubRpc as any);
+      jest
+        .mocked(getHubBatchHttpRpc)
+        .mockResolvedValueOnce(mockedHubRpc as any);
 
       await expect(
         service.attestWithdrawRequest(withdrawRequestInput),
       ).rejects.toThrow("Hash to sign not set for withdraw request at index 0");
+    });
+
+    it("deduplicates reads while preserving requested order and duplicates", async () => {
+      const hashesToSign = [
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
+      ];
+      const readContract = jest
+        .fn<any>()
+        .mockResolvedValueOnce(hashesToSign[1])
+        .mockResolvedValueOnce(hashesToSign[0]);
+      jest.mocked(getHubBatchHttpRpc).mockResolvedValueOnce({
+        readContract,
+      } as any);
+
+      const result = await service.getWithdrawRequestHashesToSign(
+        {
+          chainId: 1,
+          allocator: "0x0000000000000000000000000000000000000005",
+          withdrawRequestHash: zeroHash.replace(/0$/, "1"),
+        },
+        [1, 0, 1],
+      );
+
+      expect(result).toEqual([
+        hashesToSign[1],
+        hashesToSign[0],
+        hashesToSign[1],
+      ]);
+      expect(readContract).toHaveBeenCalledTimes(2);
+      expect(getHubHttpRpc).not.toHaveBeenCalled();
+    });
+
+    it("falls back to concurrent reads when JSON-RPC batching fails", async () => {
+      const hashesToSign = [
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
+      ];
+      jest.mocked(getHubBatchHttpRpc).mockRejectedValueOnce(new Error("batch"));
+      const readContract = jest
+        .fn<any>()
+        .mockResolvedValueOnce(hashesToSign[0])
+        .mockResolvedValueOnce(hashesToSign[1]);
+      jest.mocked(getHubHttpRpc).mockResolvedValueOnce({ readContract } as any);
+
+      await expect(
+        service.getWithdrawRequestHashesToSign(
+          {
+            chainId: 1,
+            allocator: "0x0000000000000000000000000000000000000005",
+            withdrawRequestHash: zeroHash.replace(/0$/, "1"),
+          },
+          [0, 1],
+        ),
+      ).resolves.toEqual(hashesToSign);
+      expect(readContract).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -1399,14 +1963,27 @@ describe("AttestationService", () => {
   });
 
   describe("attestWithdrawAndFill", () => {
+    beforeEach(() => {
+      mockExecutorFeesCharged(false);
+    });
+
     const buildWithdrawAndFillFixture = async (overrides?: {
+      chainId?: string;
       multipleOutputs?: boolean;
       withFees?: boolean;
       wrongFeeCurrency?: boolean;
+      orderCurrency?: string;
+      outputCurrency?: string;
+      outputCalls?: string[];
+      outputExtraData?: string;
+      refunds?: Order["inputs"][number]["refunds"];
     }) => {
+      const chainId = overrides?.chainId ?? "ethereum";
       const solverAddress = "0x1234567890123456789012345678901234567890";
       const depositor = "0x0987654321098765432109876543210987654321";
       const currency = "0x1111111111111111111111111111111111111111";
+      const orderCurrency = overrides?.orderCurrency ?? currency;
+      const outputCurrency = overrides?.outputCurrency ?? currency;
       const outputRecipient = "0x3333333333333333333333333333333333333333";
       const amount = "1000";
       const timestamp = "1234567890";
@@ -1418,21 +1995,21 @@ describe("AttestationService", () => {
       const order: Order = {
         version: "v1",
         salt: "0x1",
-        solverChainId: "ethereum",
+        solverChainId: chainId,
         solver: solverAddress,
         inputs: [
           {
             payment: {
-              chainId: "ethereum",
-              currency,
+              chainId,
+              currency: orderCurrency,
               amount,
               weight: "1",
             },
-            refunds: [
+            refunds: overrides?.refunds ?? [
               {
-                chainId: "ethereum",
+                chainId,
                 recipient: outputRecipient,
-                currency,
+                currency: orderCurrency,
                 minimumAmount: amount,
                 deadline: Math.floor(Date.now() / 1000) + 3600,
                 extraData: "0x",
@@ -1441,17 +2018,17 @@ describe("AttestationService", () => {
           },
         ],
         output: {
-          chainId: "ethereum",
+          chainId,
           payments: [
             {
               recipient: outputRecipient,
-              currency,
+              currency: outputCurrency,
               minimumAmount: amount,
               expectedAmount: amount,
             },
           ],
-          calls: [],
-          extraData: "0x",
+          calls: overrides?.outputCalls ?? [],
+          extraData: overrides?.outputExtraData ?? "0x",
           deadline: Math.floor(Date.now() / 1000) + 3600,
         },
         fees: [],
@@ -1466,18 +2043,18 @@ describe("AttestationService", () => {
       }
       if (overrides?.withFees) {
         order.fees.push({
-          recipientChainId: "ethereum",
+          recipientChainId: chainId,
           recipient: "0x5555555555555555555555555555555555555555",
-          currencyChainId: "ethereum",
+          currencyChainId: chainId,
           currency,
           amount: "1",
         });
       }
       if (overrides?.wrongFeeCurrency) {
         order.fees.push({
-          recipientChainId: "ethereum",
+          recipientChainId: chainId,
           recipient: "0x5555555555555555555555555555555555555555",
-          currencyChainId: "ethereum",
+          currencyChainId: chainId,
           currency: "0x9999999999999999999999999999999999999999",
           amount: "1",
         });
@@ -1486,7 +2063,7 @@ describe("AttestationService", () => {
       const orderId = getOrderId(order, await getSdkChainsConfig());
       const mockDepositMessage = {
         data: {
-          chainId: "ethereum",
+          chainId,
           transactionId,
         },
         result: {
@@ -1515,13 +2092,15 @@ describe("AttestationService", () => {
         onchainId,
         amount,
         currency,
+        orderCurrency,
         outputRecipient,
         depositor,
         timestamp,
+        chainId,
       };
     };
 
-    it("returns deposit execution and swap-and-withdraw request", async () => {
+    it("defaults the input currency to the deposit currency", async () => {
       const fixture = await buildWithdrawAndFillFixture();
       const nonce = "explicit-nonce";
 
@@ -1587,9 +2166,101 @@ describe("AttestationService", () => {
       );
     });
 
-    it("rejects orders with multiple outputs", async () => {
+    it("threads the deposit mode through to the vm attestor", async () => {
+      const fixture = await buildWithdrawAndFillFixture();
+
+      await service.attestWithdrawAndFill({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        mode: "fast",
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      const attestor: any = await mockGetVmAttestor.mock.results.at(-1)?.value;
+      expect(attestor.getDepositoryDepositMessages).toHaveBeenCalledWith(
+        "ethereum",
+        fixture.transactionId,
+        undefined,
+        { mode: "fast" },
+      );
+    });
+
+    it("allows any input currency after order fees are charged", async () => {
+      const orderCurrency = "0x2222222222222222222222222222222222222222";
+      // Neither the deposit, the order input payment nor any refund option
+      // uses this currency — once fees are charged none of them constrain it
+      const inputCurrency = "0x3333333333333333333333333333333333333333";
+      const readContract = mockExecutorFeesCharged(true);
       const fixture = await buildWithdrawAndFillFixture({
-        multipleOutputs: true,
+        orderCurrency,
+        wrongFeeCurrency: true,
+      });
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.inCurrency).toBe(
+        `0x${Buffer.from(encodeAddress(inputCurrency, "ethereum-vm")).toString(
+          "hex",
+        )}`,
+      );
+      // Already-charged fees cannot be charged again, so they are left out
+      // rather than signed over in a denomination that no longer applies
+      expect(result.executeAndWithdrawRequest.fees).toEqual([]);
+      expect(decodeAction(result.execution.actions[0])).toEqual(
+        expect.objectContaining({
+          type: ActionType.MINT,
+          data: expect.objectContaining({
+            hubTokenId: generateTokenId({
+              address: fixture.currency,
+              chainId: "ethereum",
+              family: "ethereum-vm",
+            }),
+          }),
+        }),
+      );
+      expect(readContract).toHaveBeenCalledWith(
+        expect.objectContaining({
+          functionName: "feesChargedByOrderAddress",
+          args: [result.executeAndWithdrawRequest.orderAddress],
+        }),
+      );
+      // The charged/uncharged state is read exactly once per attestation
+      expect(readContract).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a caller input currency that differs before fees are charged", async () => {
+      const fixture = await buildWithdrawAndFillFixture();
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "ethereum",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: "0x3333333333333333333333333333333333333333",
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+        }),
+      ).rejects.toThrow(
+        "Input currency must match the deposit currency until order fees are charged",
+      );
+    });
+
+    it("rejects an order input currency that differs from the deposit before fees are charged", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        orderCurrency: "0x2222222222222222222222222222222222222222",
       });
 
       await expect(
@@ -1601,10 +2272,383 @@ describe("AttestationService", () => {
           orderSignature: "0x" + "00".repeat(65),
           nonce: "explicit-nonce",
         }),
+      ).rejects.toThrow("Deposit currency does not match order input currency");
+    });
+
+    it("fills regardless of the order's refund options", async () => {
+      // Unusable for a refund (wrong chain, ambiguous), irrelevant to a fill
+      const refund = {
+        chainId: "polygon",
+        recipient: "0x7777777777777777777777777777777777777777",
+        currency: "0x9999999999999999999999999999999999999999",
+        minimumAmount: "1000",
+        deadline: Math.floor(Date.now() / 1000) + 3600,
+        extraData: "0x",
+      };
+      const fixture = await buildWithdrawAndFillFixture({
+        refunds: [refund, { ...refund, minimumAmount: "1" }],
+      });
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.outCurrency).toBe(
+        `0x${Buffer.from(
+          encodeAddress(fixture.currency, "ethereum-vm"),
+        ).toString("hex")}`,
+      );
+    });
+
+    it("rejects orders with multiple outputs", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        multipleOutputs: true,
+      });
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "ethereum",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+        }),
       ).rejects.toThrow("Only single-output payment orders are allowed");
     });
 
-    it("maps input-currency order fees into the execute-and-withdraw request", async () => {
+    it("rejects fill orders with calls", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        outputCalls: ["0x1234"],
+      });
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "ethereum",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+        }),
+      ).rejects.toThrow("Fill orders with calls are not supported");
+    });
+
+    it("accepts fill orders with extra data", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        outputExtraData: "0x1234",
+      });
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.execution).toBeDefined();
+      expect(result.executeAndWithdrawRequest.data).toBe("0x");
+    });
+
+    it("encodes additional withdrawal data with the destination VM codec", async () => {
+      const fixture = await buildWithdrawAndFillFixture();
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+        additionalData: {},
+      });
+
+      expect(result.executeAndWithdrawRequest.data).toBe("0x");
+    });
+
+    // The expected max block height resolves to `latestBlockNumber +
+    // (executionExpirationSeconds + withdrawalDelaySeconds) / blockTimeSeconds`,
+    // so with the mocked config: 1000 + (864000 + 604800) / 2 = 735400
+    const mockGatewaySourceLatestBlockNumber = (blockNumber: bigint) => {
+      jest.mocked(getEthereumVmRpc).mockResolvedValue({
+        getBlockNumber: jest
+          .fn()
+          .mockImplementation(() => Promise.resolve(blockNumber)),
+      } as any);
+    };
+
+    it("uses Gateway USDC as the withdrawal currency when requested", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+      mockGatewaySourceLatestBlockNumber(1000n);
+      const nonce = "explicit-nonce";
+      const additionalData = {
+        "gateway-vm": {
+          allocator: "0x0000000000000000000000000000000000000005",
+          destinationChainId: "polygon",
+          maxBlockHeight: "735450",
+        },
+      };
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "polygon",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce,
+        additionalData,
+        useGatewaySource: "polygon-gateway",
+      });
+
+      const expectedOrderAddress = `0x${keccak256(
+        encodePacked(
+          ["string", "bytes", "uint256", "bytes32"],
+          [
+            "polygon",
+            `0x${Buffer.from(
+              encodeAddress(fixture.depositor, "ethereum-vm"),
+            ).toString("hex")}`,
+            BigInt(fixture.timestamp),
+            fixture.orderId as Hex,
+          ],
+        ),
+      )
+        .slice(2)
+        .slice(-40)}` as `0x${string}`;
+
+      expect(result.executeAndWithdrawRequest).toEqual({
+        inChainId: "polygon",
+        inCurrency: `0x${Buffer.from(
+          encodeAddress(fixture.currency, "ethereum-vm"),
+        ).toString("hex")}`,
+        outChainId: "polygon-gateway",
+        outCurrency: zeroAddress,
+        outAmountMinimum: fixture.amount,
+        depository: `0x${Buffer.from(
+          encodeAddress(
+            "0x2222222222222222222222222222222222222222",
+            "ethereum-vm",
+          ),
+        ).toString("hex")}`,
+        orderAddress: expectedOrderAddress,
+        receiver: `0x${Buffer.from(
+          encodeAddress(fixture.outputRecipient, "ethereum-vm"),
+        ).toString("hex")}`,
+        data: encodeWithdrawRequestAdditionalData({
+          vmType: "gateway-vm",
+          additionalData,
+        }),
+        fees: [],
+        nonce,
+        deadline: fixture.order.output.deadline.toString(),
+      });
+    });
+
+    it("commits routed destination calls in Gateway withdrawal data", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+      mockGatewaySourceLatestBlockNumber(1000n);
+      const calls = [
+        {
+          to: "0x0000000000000000000000000000000000000007",
+          data: "0x1234",
+          value: "0",
+          allowFailure: false,
+        },
+      ];
+      const additionalData = {
+        "gateway-vm": {
+          allocator: "0x0000000000000000000000000000000000000005",
+          destinationChainId: "polygon",
+          maxBlockHeight: "735450",
+          destinationData: {
+            vmType: "ethereum-vm" as const,
+            router: "0x0000000000000000000000000000000000000006",
+            calls,
+          },
+        },
+      };
+
+      const result = await service.attestWithdrawAndFill({
+        chainId: "polygon",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+        additionalData,
+        useGatewaySource: "polygon-gateway",
+      });
+
+      expect(result.executeAndWithdrawRequest.data).toBe(
+        encodeWithdrawRequestAdditionalData({
+          vmType: "gateway-vm",
+          additionalData,
+        }),
+      );
+      expect(result.executeAndWithdrawRequest.data).not.toBe(
+        encodeWithdrawRequestAdditionalData({
+          vmType: "gateway-vm",
+          additionalData: {
+            "gateway-vm": {
+              allocator: additionalData["gateway-vm"].allocator,
+              destinationChainId:
+                additionalData["gateway-vm"].destinationChainId,
+              maxBlockHeight: additionalData["gateway-vm"].maxBlockHeight,
+            },
+          },
+        }),
+      );
+    });
+
+    it("requires Gateway additional withdrawal data when Gateway is requested", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "polygon",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+          useGatewaySource: "polygon-gateway",
+        }),
+      ).rejects.toThrow("Additional data is required for gateway-vm");
+    });
+
+    it("rejects a Gateway destination chain that does not match the order", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "polygon",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+          additionalData: {
+            "gateway-vm": {
+              allocator: "0x0000000000000000000000000000000000000005",
+              destinationChainId: "ethereum",
+              maxBlockHeight: "735450",
+            },
+          },
+          useGatewaySource: "polygon-gateway",
+        }),
+      ).rejects.toThrow(
+        "Gateway destination chain ethereum does not match the order destination chain polygon",
+      );
+    });
+
+    it("rejects a Gateway maxBlockHeight above the allowed tolerance", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+      mockGatewaySourceLatestBlockNumber(1000n);
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "polygon",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+          additionalData: {
+            "gateway-vm": {
+              allocator: "0x0000000000000000000000000000000000000005",
+              destinationChainId: "polygon",
+              maxBlockHeight: "735901",
+            },
+          },
+          useGatewaySource: "polygon-gateway",
+        }),
+      ).rejects.toThrow(
+        "Gateway maxBlockHeight 735901 is outside the allowed range for polygon",
+      );
+    });
+
+    it("rejects a Gateway maxBlockHeight below the required expiration window", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+      mockGatewaySourceLatestBlockNumber(1000n);
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "polygon",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+          additionalData: {
+            "gateway-vm": {
+              allocator: "0x0000000000000000000000000000000000000005",
+              destinationChainId: "polygon",
+              maxBlockHeight: "735399",
+            },
+          },
+          useGatewaySource: "polygon-gateway",
+        }),
+      ).rejects.toThrow(
+        "Gateway maxBlockHeight 735399 is outside the allowed range for polygon",
+      );
+    });
+
+    it("rejects an unparseable Gateway maxBlockHeight", async () => {
+      const fixture = await buildWithdrawAndFillFixture({
+        chainId: "polygon",
+      });
+
+      await expect(
+        service.attestWithdrawAndFill({
+          chainId: "polygon",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+          additionalData: {
+            "gateway-vm": {
+              allocator: "0x0000000000000000000000000000000000000005",
+              destinationChainId: "polygon",
+              maxBlockHeight: "not-a-number",
+            },
+          },
+          useGatewaySource: "polygon-gateway",
+        }),
+      ).rejects.toThrow("Invalid Gateway maxBlockHeight");
+    });
+
+    it("maps deposit-currency order fees into the execute-and-withdraw request", async () => {
       const fixture = await buildWithdrawAndFillFixture({
         withFees: true,
       });
@@ -1614,6 +2658,7 @@ describe("AttestationService", () => {
         chainId: "ethereum",
         transactionId: fixture.transactionId,
         onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
         order: fixture.order,
         orderSignature: "0x" + "00".repeat(65),
         nonce,
@@ -1632,7 +2677,7 @@ describe("AttestationService", () => {
       ]);
     });
 
-    it("rejects fees not denominated in the input currency", async () => {
+    it("rejects fees not denominated in the deposit currency", async () => {
       const fixture = await buildWithdrawAndFillFixture({
         wrongFeeCurrency: true,
       });
@@ -1642,6 +2687,7 @@ describe("AttestationService", () => {
           chainId: "ethereum",
           transactionId: fixture.transactionId,
           onchainId: fixture.onchainId,
+          inputCurrency: fixture.currency,
           order: fixture.order,
           orderSignature: "0x" + "00".repeat(65),
           nonce: "explicit-nonce",
@@ -1653,12 +2699,20 @@ describe("AttestationService", () => {
   describe("attestWithdrawAndRefund", () => {
     const refundRecipient = "0x7777777777777777777777777777777777777777";
 
+    beforeEach(() => {
+      mockExecutorFeesCharged(false);
+    });
+
     const buildWithdrawAndRefundFixture = async (overrides?: {
       refunds?: Order["inputs"][number]["refunds"];
+      orderCurrency?: string;
+      outputCalls?: string[];
+      outputExtraData?: string;
     }) => {
       const solverAddress = "0x1234567890123456789012345678901234567890";
       const depositor = "0x0987654321098765432109876543210987654321";
       const currency = "0x1111111111111111111111111111111111111111";
+      const orderCurrency = overrides?.orderCurrency ?? currency;
       const amount = "1000";
       const timestamp = "1234567890";
       const transactionId =
@@ -1675,7 +2729,7 @@ describe("AttestationService", () => {
           {
             payment: {
               chainId: "ethereum",
-              currency,
+              currency: orderCurrency,
               amount,
               weight: "1",
             },
@@ -1683,7 +2737,7 @@ describe("AttestationService", () => {
               {
                 chainId: "ethereum",
                 recipient: refundRecipient,
-                currency,
+                currency: orderCurrency,
                 minimumAmount: amount,
                 deadline: Math.floor(Date.now() / 1000) + 3600,
                 extraData: "0x",
@@ -1701,8 +2755,8 @@ describe("AttestationService", () => {
               expectedAmount: amount,
             },
           ],
-          calls: [],
-          extraData: "0x",
+          calls: overrides?.outputCalls ?? [],
+          extraData: overrides?.outputExtraData ?? "0x",
           deadline: Math.floor(Date.now() / 1000) + 3600,
         },
         fees: [],
@@ -1739,12 +2793,13 @@ describe("AttestationService", () => {
         onchainId,
         amount,
         currency,
+        orderCurrency,
         depositor,
         timestamp,
       };
     };
 
-    it("refunds the input currency back to the refund recipient", async () => {
+    it("defaults the input currency to the deposit currency for refunds", async () => {
       const fixture = await buildWithdrawAndRefundFixture();
       const nonce = "explicit-nonce";
 
@@ -1800,11 +2855,165 @@ describe("AttestationService", () => {
       });
     });
 
-    it("rejects when no refund matches the input currency/chain", async () => {
+    it("pulls and refunds independent currencies after fees are charged", async () => {
+      const orderCurrency = "0x2222222222222222222222222222222222222222";
+      // No refund option covers this — post-charge nothing constrains the pull
+      const inputCurrency = "0x3333333333333333333333333333333333333333";
+      mockExecutorFeesCharged(true);
+      const fixture = await buildWithdrawAndRefundFixture({
+        orderCurrency,
+        outputCalls: ["0x1234"],
+        outputExtraData: "0x1234",
+      });
+
+      const result = await service.attestWithdrawAndRefund({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.inCurrency).toBe(
+        `0x${Buffer.from(encodeAddress(inputCurrency, "ethereum-vm")).toString(
+          "hex",
+        )}`,
+      );
+      // The payout still comes from the order's signed refund options
+      expect(result.executeAndWithdrawRequest.outCurrency).toBe(
+        `0x${Buffer.from(encodeAddress(orderCurrency, "ethereum-vm")).toString(
+          "hex",
+        )}`,
+      );
+      expect(decodeAction(result.execution.actions[0])).toEqual(
+        expect.objectContaining({
+          type: ActionType.MINT,
+          data: expect.objectContaining({
+            hubTokenId: generateTokenId({
+              address: fixture.currency,
+              chainId: "ethereum",
+              family: "ethereum-vm",
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("defaults the refund to the order's first refund option", async () => {
       const fixture = await buildWithdrawAndRefundFixture({
         refunds: [
           {
             chainId: "ethereum",
+            recipient: "0x7777777777777777777777777777777777777777",
+            currency: "0x1111111111111111111111111111111111111111",
+            minimumAmount: "900",
+            deadline: Math.floor(Date.now() / 1000) + 3600,
+            extraData: "0x",
+          },
+          {
+            chainId: "ethereum",
+            recipient: "0x8888888888888888888888888888888888888888",
+            currency: "0x2222222222222222222222222222222222222222",
+            minimumAmount: "500",
+            deadline: Math.floor(Date.now() / 1000) + 7200,
+            extraData: "0x",
+          },
+        ],
+      });
+
+      const result = await service.attestWithdrawAndRefund({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.outAmountMinimum).toBe("900");
+      expect(result.executeAndWithdrawRequest.deadline).toBe(
+        fixture.order.inputs[0].refunds[0].deadline.toString(),
+      );
+    });
+
+    it("selects the refund option at the caller's index", async () => {
+      const fixture = await buildWithdrawAndRefundFixture({
+        refunds: [
+          {
+            chainId: "ethereum",
+            recipient: "0x7777777777777777777777777777777777777777",
+            currency: "0x1111111111111111111111111111111111111111",
+            minimumAmount: "900",
+            deadline: Math.floor(Date.now() / 1000) + 3600,
+            extraData: "0x",
+          },
+          {
+            chainId: "ethereum",
+            recipient: "0x8888888888888888888888888888888888888888",
+            currency: "0x2222222222222222222222222222222222222222",
+            minimumAmount: "500",
+            deadline: Math.floor(Date.now() / 1000) + 7200,
+            extraData: "0x",
+          },
+        ],
+      });
+
+      const result = await service.attestWithdrawAndRefund({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        refundIndex: 1,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.outCurrency).toBe(
+        `0x${Buffer.from(
+          encodeAddress(
+            "0x2222222222222222222222222222222222222222",
+            "ethereum-vm",
+          ),
+        ).toString("hex")}`,
+      );
+      expect(result.executeAndWithdrawRequest.outAmountMinimum).toBe("500");
+      expect(result.executeAndWithdrawRequest.receiver).toBe(
+        `0x${Buffer.from(
+          encodeAddress(
+            "0x8888888888888888888888888888888888888888",
+            "ethereum-vm",
+          ),
+        ).toString("hex")}`,
+      );
+      // The selected option also drives the signed request's deadline
+      expect(result.executeAndWithdrawRequest.deadline).toBe(
+        fixture.order.inputs[0].refunds[1].deadline.toString(),
+      );
+    });
+
+    it("rejects a refund index outside the order's refund options", async () => {
+      const fixture = await buildWithdrawAndRefundFixture();
+
+      await expect(
+        service.attestWithdrawAndRefund({
+          chainId: "ethereum",
+          transactionId: fixture.transactionId,
+          onchainId: fixture.onchainId,
+          refundIndex: 1,
+          order: fixture.order,
+          orderSignature: "0x" + "00".repeat(65),
+          nonce: "explicit-nonce",
+        }),
+      ).rejects.toThrow("Order input has no refund option at that index");
+    });
+
+    it("refunds on the selected option's own chain", async () => {
+      const fixture = await buildWithdrawAndRefundFixture({
+        refunds: [
+          {
+            chainId: "polygon",
             recipient: refundRecipient,
             currency: "0x9999999999999999999999999999999999999999",
             minimumAmount: "1000",
@@ -1814,50 +3023,54 @@ describe("AttestationService", () => {
         ],
       });
 
-      await expect(
-        service.attestWithdrawAndRefund({
-          chainId: "ethereum",
-          transactionId: fixture.transactionId,
-          onchainId: fixture.onchainId,
-          order: fixture.order,
-          orderSignature: "0x" + "00".repeat(65),
-          nonce: "explicit-nonce",
-        }),
-      ).rejects.toThrow("Non-matching refund option");
-    });
-
-    it("rejects when multiple refunds match the input currency/chain", async () => {
-      const fixture = await buildWithdrawAndRefundFixture({
-        refunds: [
-          {
-            chainId: "ethereum",
-            recipient: refundRecipient,
-            currency: "0x1111111111111111111111111111111111111111",
-            minimumAmount: "1000",
-            deadline: Math.floor(Date.now() / 1000) + 3600,
-            extraData: "0x",
-          },
-          {
-            chainId: "ethereum",
-            recipient: refundRecipient,
-            currency: "0x1111111111111111111111111111111111111111",
-            minimumAmount: "500",
-            deadline: Math.floor(Date.now() / 1000) + 3600,
-            extraData: "0x",
-          },
-        ],
+      const result = await service.attestWithdrawAndRefund({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
       });
 
-      await expect(
-        service.attestWithdrawAndRefund({
-          chainId: "ethereum",
-          transactionId: fixture.transactionId,
-          onchainId: fixture.onchainId,
-          order: fixture.order,
-          orderSignature: "0x" + "00".repeat(65),
-          nonce: "explicit-nonce",
-        }),
-      ).rejects.toThrow("Only single-refund options are allowed");
+      // Pulled on the deposit chain, paid out on the refund option's chain
+      expect(result.executeAndWithdrawRequest.inChainId).toBe("ethereum");
+      expect(result.executeAndWithdrawRequest.outChainId).toBe("polygon");
+      expect(result.executeAndWithdrawRequest.outCurrency).toBe(
+        `0x${Buffer.from(
+          encodeAddress(
+            "0x9999999999999999999999999999999999999999",
+            "ethereum-vm",
+          ),
+        ).toString("hex")}`,
+      );
+    });
+
+    it("distinguishes refund options that share a currency", async () => {
+      const refund = {
+        chainId: "ethereum",
+        recipient: refundRecipient,
+        currency: "0x1111111111111111111111111111111111111111",
+        minimumAmount: "1000",
+        deadline: Math.floor(Date.now() / 1000) + 3600,
+        extraData: "0x",
+      };
+      const fixture = await buildWithdrawAndRefundFixture({
+        refunds: [refund, { ...refund, minimumAmount: "500" }],
+      });
+
+      const result = await service.attestWithdrawAndRefund({
+        chainId: "ethereum",
+        transactionId: fixture.transactionId,
+        onchainId: fixture.onchainId,
+        inputCurrency: fixture.currency,
+        refundIndex: 1,
+        order: fixture.order,
+        orderSignature: "0x" + "00".repeat(65),
+        nonce: "explicit-nonce",
+      });
+
+      expect(result.executeAndWithdrawRequest.outAmountMinimum).toBe("500");
     });
   });
 

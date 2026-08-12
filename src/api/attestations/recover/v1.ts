@@ -1,18 +1,15 @@
 import { Type } from "@fastify/type-provider-typebox";
 
 import {
-  areExecutionsEqual,
-  filterSignaturesByDomain,
   Endpoint,
   ErrorResponses,
   executionSchema,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
   orderSchema,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import { signExecutionMessage } from "../../../common/signer";
-import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
 
 const Schema = {
@@ -71,38 +68,24 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const attestationService = new AttestationService();
-    const { execution } = await attestationService.attestRecover(req.body);
-
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (areExecutionsEqual(peerData.execution, execution)) {
-                return peerData.execution.signatures;
-              }
-
-              return [];
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          const { execution } =
+            await new AttestationService().attestRecover(req.body);
+          return {
+            execution: {
+              ...execution,
+              signatures: [await signExecutionMessage(execution)],
             },
-          })
-        : [];
-
-    const localExecutionSignature = await signExecutionMessage(execution);
-
-    return reply.send({
-      execution: {
-        ...execution,
-        signatures: [
-          localExecutionSignature,
-          ...filterSignaturesByDomain(peerSignatures, localExecutionSignature, {
-            chainId: "oracleChainId",
-            contract: "oracleContract",
-          }),
-        ],
-      },
-    });
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

@@ -1,22 +1,22 @@
 import { Type } from "@fastify/type-provider-typebox";
 
 import {
-  areExecuteAndWithdrawRequestsEqual,
-  areExecutionsEqual,
+  depositModeSchema,
   Endpoint,
   ErrorResponses,
   executeAndWithdrawRequestSchema,
   executionSchema,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
+  feeCommitmentSchema,
   orderSchema,
+  withdrawRequestAdditionalDataSchema,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import {
   signExecuteAndWithdrawRequestMessage,
   signExecutionMessage,
 } from "../../../common/signer";
-import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
 
 const MessageData = Type.Object({
@@ -26,9 +26,24 @@ const MessageData = Type.Object({
   transactionId: Type.String({
     description: "The transaction id to attest",
   }),
+  mode: Type.Optional(depositModeSchema),
+  feeCommitment: Type.Optional(feeCommitmentSchema),
   onchainId: Type.String({
     description: "The onchain id of the deposit",
   }),
+  inputCurrency: Type.Optional(
+    Type.String({
+      description:
+        "The currency to pull from the order address (defaults to the deposit currency). Must match the deposit currency until the order's fees are charged, afterwards any currency is allowed.",
+    }),
+  ),
+  refundIndex: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description:
+        "Index of the order refund option to pay out, which supplies the refund chain and currency (defaults to the first option). Need not be on the deposit chain.",
+    }),
+  ),
   order: orderSchema,
   orderSignature: Type.String({
     description: "The solver signature of the order",
@@ -36,6 +51,13 @@ const MessageData = Type.Object({
   nonce: Type.String({
     description: "Nonce to pass-through to the underlying withdraw request",
   }),
+  additionalData: Type.Optional(withdrawRequestAdditionalDataSchema),
+  useGatewaySource: Type.Optional(
+    Type.String({
+      description:
+        "Gateway chain id to use as the withdrawal currency source (only relevant for Circle USDC withdrawals)",
+    }),
+  ),
   hints: Type.Optional(
     Type.Object(
       {
@@ -48,7 +70,10 @@ const MessageData = Type.Object({
           }),
         ),
       },
-      { description: "Hints for attesting the deposit transaction" },
+      {
+        description:
+          "Hints for attesting the deposit transaction and building the withdraw request",
+      },
     ),
   ),
   requestPeerSignatures: Type.Optional(
@@ -78,71 +103,33 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const attestationService = new AttestationService();
-    const { execution, executeAndWithdrawRequest } =
-      await attestationService.attestWithdrawAndRefund(req.body);
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          const { execution, executeAndWithdrawRequest } =
+            await new AttestationService().attestWithdrawAndRefund(req.body);
+          const [executionSignature, withdrawSignature] = await Promise.all([
+            signExecutionMessage(execution),
+            signExecuteAndWithdrawRequestMessage(executeAndWithdrawRequest),
+          ]);
 
-    const peerResponses =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              const executionSigner =
-                peerData?.execution?.signatures?.[0]?.oracleSigner;
-              const withdrawSigner =
-                peerData?.executeAndWithdrawRequest?.signatures?.[0]
-                  ?.oracleSigner;
-
-              // Accept the peer only if both signed messages match ours AND
-              // both carry a signature from the same oracle signer. The
-              // multisig expects a consistent signer set across the execution
-              // and executeAndWithdrawRequest messages, so a peer missing
-              // either signature (or signing them with different signers) is
-              // unusable and must be skipped.
-              if (
-                areExecutionsEqual(peerData.execution, execution) &&
-                areExecuteAndWithdrawRequestsEqual(
-                  peerData.executeAndWithdrawRequest,
-                  executeAndWithdrawRequest,
-                ) &&
-                executionSigner &&
-                withdrawSigner &&
-                executionSigner.toLowerCase() === withdrawSigner.toLowerCase()
-              ) {
-                // This endpoint signs two messages, so collect the whole peer
-                // payload (one entry per peer) and flatMap both signature
-                // arrays below.
-                return [peerData];
-              }
-
-              return [];
+          return {
+            execution: {
+              ...execution,
+              signatures: [executionSignature],
             },
-            getSigner: (peerData: any) =>
-              peerData?.execution?.signatures?.[0]?.oracleSigner,
-          })
-        : [];
-
-    return reply.send({
-      execution: {
-        ...execution,
-        signatures: [
-          await signExecutionMessage(execution),
-          ...peerResponses.flatMap(
-            (peerResponse) => peerResponse.execution.signatures,
-          ),
-        ],
-      },
-      executeAndWithdrawRequest: {
-        ...executeAndWithdrawRequest,
-        signatures: [
-          await signExecuteAndWithdrawRequestMessage(executeAndWithdrawRequest),
-          ...peerResponses.flatMap(
-            (peerResponse) => peerResponse.executeAndWithdrawRequest.signatures,
-          ),
-        ],
-      },
-    });
+            executeAndWithdrawRequest: {
+              ...executeAndWithdrawRequest,
+              signatures: [withdrawSignature],
+            },
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

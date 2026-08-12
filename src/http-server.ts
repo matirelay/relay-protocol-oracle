@@ -8,6 +8,7 @@ import { isValidApiKey } from "./common/api-key";
 import { logger } from "./common/logger";
 import { createFixedWindowRateLimiter } from "./common/rate-limit";
 import { config } from "./config";
+import { createEventAttestationMonitor } from "./services/attestation/event";
 import { getSigningWallet } from "./signers";
 
 const COMPONENT = "http-server";
@@ -94,36 +95,41 @@ export const buildHttpServer = async () => {
   return httpServer;
 };
 
+export const validateLocalOracleSigner = (signerAddress: string): void => {
+  const normalizedSignerAddress = signerAddress.toLowerCase();
+  if (
+    config.oracleSigners &&
+    !config.oracleSigners.has(normalizedSignerAddress)
+  ) {
+    throw new Error(
+      `Local oracle signer ${normalizedSignerAddress} is not included in ORACLE_SIGNERS`,
+    );
+  }
+};
+
 export const startHttpServer = async () => {
+  const signer = await getSigningWallet();
+  const signerAddress = signer.address.toLowerCase();
+  validateLocalOracleSigner(signerAddress);
+
   const httpServer = await buildHttpServer();
+  const eventAttestationMonitor = createEventAttestationMonitor();
+  httpServer.addHook("onClose", async () => {
+    await eventAttestationMonitor.stop();
+  });
+  await httpServer.listen({
+    host: "0.0.0.0",
+    port: config.httpPort,
+  });
 
-  // Start listening
-  httpServer.listen(
-    {
-      host: "0.0.0.0",
-      port: config.httpPort,
-    },
-    async (error) => {
-      if (error) {
-        logger.error(
-          COMPONENT,
-          JSON.stringify({
-            msg: `Failed to start http server: ${error}`,
-            stack: error?.stack,
-          }),
-        );
-        process.exit(1);
-      }
-
-      const signer = await getSigningWallet();
-
-      logger.info(
-        COMPONENT,
-        JSON.stringify({
-          msg: "Http server started",
-          signer: signer.address.toLowerCase(),
-        }),
-      );
-    },
+  logger.info(
+    COMPONENT,
+    JSON.stringify({
+      msg: "Http server started",
+      signer: signerAddress,
+    }),
   );
+  eventAttestationMonitor.start();
+
+  return httpServer;
 };

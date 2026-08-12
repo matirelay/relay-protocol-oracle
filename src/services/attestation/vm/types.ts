@@ -1,5 +1,4 @@
 import {
-  DenormalizedSubmitWithdrawRequest,
   DepositoryDepositMessage,
   DepositoryWithdrawalMessage,
 } from "@relay-protocol/settlement-sdk";
@@ -60,10 +59,4 @@ export abstract class VmAttestor {
     calls: string[],
     extraData: string,
   ): Promise<boolean>;
-
-  public validateSubmitWithdrawRequest(
-    _data: DenormalizedSubmitWithdrawRequest,
-  ): Promise<boolean> {
-    return new Promise((resolve) => resolve(true));
-  }
 }

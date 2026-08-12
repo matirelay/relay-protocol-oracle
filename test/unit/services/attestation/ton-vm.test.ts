@@ -6,6 +6,7 @@ import {
   beginCell,
   Cell,
   internal,
+  loadTransaction,
   storeMessageRelaxed,
   TupleItem,
   TupleReader,
@@ -50,13 +51,33 @@ const ORDER_ID =
 const DEPOSIT_ORDER_ID =
   "0xdeadbeefcafef00d0011223344556677889900aabbccddeeff00112233445566";
 
+// Mainnet deposit that reached the depository with the wallet-default
+// bounce=true and was skipped by the old flag check. Serialized Transaction.
+const MAINNET_BOUNCEABLE_DEPOSIT_TX_HASH =
+  "1b99258bc349b69a7389bcd42391d9d564be3976485514658d3998ebaccdb7d9";
+const MAINNET_BOUNCEABLE_DEPOSIT_LT = "93254231000003";
+const MAINNET_BOUNCEABLE_DEPOSIT_BOC =
+  "b5ee9c72010208010001da0003b37ab746b034ea036b7ac5147837a57827bd3917bc3f55" +
+  "06d47479e87ec87ef2554000054d0715003c3bee53aea1cafeeff16be48db3c347314157" +
+  "bc8f2798d453378035b1a38a4d0ac000054d043f413946a69a5b60001452ca2801020301" +
+  "01a004008272ec623b74ad522ade58b62538e755c1a56f8458738df13a6c70dc4472e90b" +
+  "84f026330a4e91ba3df46e7b0b995ae364b37e5e4a5848c217a39b194fa64b5ba8d40215" +
+  "044349038057f65852c891060701b16801212a827ee109d651afbee09e138b0da2a798cd" +
+  "84d92b5a0bd02b5eb69f9e1ac7002add1ac0d3a80dadeb1451e0de95e09ef4e45ef0fd54" +
+  "1b51d1e7a1fb21fbc9551038057f64060240680000a9a0e2a00784d4d34b6cc005008c00" +
+  "000000307866336666623437626330643864323739303763623436353138313431396336" +
+  "333733303737396335633262653164303764396662346236653231646536636361009e40" +
+  "482c3d090000000000000000000d00000000000000000000000000000000000000000000" +
+  "000000000000000000000000000000000000000000000000000000000000000000000000" +
+  "000000000000005bc00000000000000000000000012d452da449e50b8cf7dd27861f1461" +
+  "22afe1b546bb8b70fc8216f0c614139f8e04";
+
 jest.mock("../../../../src/common/chains", () => {
   const chains: Record<string, Chain> = {
     "ton-testnet": {
       id: "ton-testnet",
       vmType: "ton-vm",
       httpRpcUrl: "https://testnet.toncenter.com/api/v2/jsonRPC",
-      hubChainId: "1",
       depository:
         "0:7777777777777777777777777777777777777777777777777777777777777777",
     },
@@ -64,7 +85,15 @@ jest.mock("../../../../src/common/chains", () => {
       id: "ton-testnet-no-dep",
       vmType: "ton-vm",
       httpRpcUrl: "https://testnet.toncenter.com/api/v2/jsonRPC",
-      hubChainId: "1",
+    },
+    // Real mainnet allocator wallet — paired with the captured on-chain
+    // transaction fixture, whose dest hash must match a configured depository.
+    "ton-mainnet-fixture": {
+      id: "ton-mainnet-fixture",
+      vmType: "ton-vm",
+      httpRpcUrl: "https://toncenter.com/api/v2/jsonRPC",
+      depository:
+        "0:ab746b034ea036b7ac5147837a57827bd3917bc3f5506d47479e87ec87ef2554",
     },
   };
   return {
@@ -74,7 +103,6 @@ jest.mock("../../../../src/common/chains", () => {
     getHubChains: async () => [],
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) => chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) => chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -131,6 +159,11 @@ type ComputePhaseMock =
   | { type: "vm"; success: boolean; exitCode: number }
   | { type: "skipped"; reason: string };
 
+type BouncePhaseMock =
+  | { type: "ok" }
+  | { type: "no-funds" }
+  | { type: "negative-funds" };
+
 const buildMockTx = ({
   hashHex,
   now,
@@ -144,6 +177,7 @@ const buildMockTx = ({
     | null
     | undefined,
   computePhase,
+  bouncePhase,
 }: {
   hashHex: string;
   now: number;
@@ -160,6 +194,8 @@ const buildMockTx = ({
   // — e.g. to test `skipped/no-state` (uninit dest, still success) or other
   // skip reasons.
   computePhase?: ComputePhaseMock;
+  // Present only when TVM returned the inbound value to its sender.
+  bouncePhase?: BouncePhaseMock;
 }) => ({
   hash: () => Buffer.from(hashHex, "hex"),
   now,
@@ -175,6 +211,7 @@ const buildMockTx = ({
       exitCode,
     },
     actionPhase,
+    bouncePhase,
   },
 });
 
@@ -1261,7 +1298,9 @@ describe("TonVmAttestor", () => {
       });
     };
 
-    it("ignores bounce=true inbound (TVM auto-refund would double-credit)", async () => {
+    it("attests a bounce=true inbound that TVM delivered cleanly", async () => {
+      // Wallets default to bounceable; a live depository credits the value in
+      // full, so the flag alone must not disqualify the deposit.
       setupRpcMock([], { directTx: buildDepositTx({ bounce: true }) });
 
       const result = await new TonVmAttestor().getDepositoryDepositMessages(
@@ -1269,7 +1308,81 @@ describe("TonVmAttestor", () => {
         TX_HASH_HEX,
         depositHints,
       );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].result.amount).toBe(AMOUNT.toString());
+    });
+
+    it("ignores bounce=true inbound that TVM refunded (uninit depository)", async () => {
+      // Real shape of a bounceable send to an uninit account: value is
+      // returned in full, so crediting it would double-spend.
+      setupRpcMock([], {
+        directTx: buildDepositTx({
+          bounce: true,
+          aborted: true,
+          computePhase: { type: "skipped", reason: "no-state" },
+          bouncePhase: { type: "ok" },
+          outMessages: [
+            buildMockMessage({
+              destRaw: DEPOSITOR_RAW,
+              amount: AMOUNT,
+              body: beginCell().endCell(),
+              bounced: true,
+            }),
+          ],
+        }),
+      });
+
+      const result = await new TonVmAttestor().getDepositoryDepositMessages(
+        "ton-testnet",
+        TX_HASH_HEX,
+        depositHints,
+      );
       expect(result).toEqual([]);
+    });
+
+    it("ignores bounce=true inbound aborted at an uninit depository even with no bounce phase", async () => {
+      // `aborted` + `skipped/no-state` is the one shape the revert check lets
+      // through, so it must not rely on the bounce phase being reported.
+      setupRpcMock([], {
+        directTx: buildDepositTx({
+          bounce: true,
+          aborted: true,
+          computePhase: { type: "skipped", reason: "no-state" },
+        }),
+      });
+
+      const result = await new TonVmAttestor().getDepositoryDepositMessages(
+        "ton-testnet",
+        TX_HASH_HEX,
+        depositHints,
+      );
+      expect(result).toEqual([]);
+    });
+
+    it("attests the captured mainnet bounce=true deposit", async () => {
+      // Real on-chain transaction, kept as a BOC so the parsed phase shapes are
+      // TVM output rather than a hand-rolled approximation of it.
+      const tx = loadTransaction(
+        Cell.fromBoc(Buffer.from(MAINNET_BOUNCEABLE_DEPOSIT_BOC, "hex"))[0]
+          .beginParse(),
+      );
+      setupRpcMock([], { directTx: tx });
+
+      const result = await new TonVmAttestor().getDepositoryDepositMessages(
+        "ton-mainnet-fixture",
+        MAINNET_BOUNCEABLE_DEPOSIT_TX_HASH,
+        { "ton-vm": { lt: MAINNET_BOUNCEABLE_DEPOSIT_LT } },
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].result.amount).toBe("234971097");
+      expect(result[0].result.depositId).toBe(
+        "0xf3ffb47bc0d8d27907cb465181419c63730779c5c2be1d07d9fb4b6e21de6cca",
+      );
+      expect(result[0].result.depositor).toBe(
+        "0:9095413f7084eb28d7df704f09c586d153cc66c26c95ad05e815af5b4fcf0d63",
+      );
     });
 
     it("returns a deposit message for a happy-path inbound transfer", async () => {

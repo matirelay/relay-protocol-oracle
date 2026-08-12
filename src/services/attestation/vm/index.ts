@@ -3,6 +3,7 @@ import { getChain } from "../../../common/chains";
 import { externalError } from "../../../common/error";
 
 import { EthereumVmAttestor } from "./ethereum-vm";
+import { GatewayVmAttestor } from "./gateway-vm";
 import { BitcoinVmAttestor } from "./bitcoin-vm";
 import { HyperliquidVmAttestor } from "./hyperliquid-vm";
 import { LighterVmAttestor } from "./lighter-vm";
@@ -14,6 +15,9 @@ import { XrpVmAttestor } from "./xrp-vm";
 export const getVmAttestor = async (chainId: string): Promise<VmAttestor> => {
   const chain = await getChain(chainId);
   switch (chain.vmType) {
+    case "gateway-vm":
+      return new GatewayVmAttestor();
+
     case "ethereum-vm":
       return new EthereumVmAttestor();
 

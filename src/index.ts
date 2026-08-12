@@ -58,4 +58,15 @@ setInterval(() => {
   );
 }, 60_000).unref();
 
-void startHttpServer();
+void startHttpServer().catch((error: unknown) => {
+  logger.error(
+    "http-server",
+    JSON.stringify({
+      msg: "Failed to start HTTP server",
+      error: String(error),
+      details: sanitizeError(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    }),
+  );
+  process.exit(1);
+});

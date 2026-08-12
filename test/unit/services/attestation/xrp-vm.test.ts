@@ -50,7 +50,6 @@ jest.mock("../../../../src/common/chains", () => {
       vmType: "xrp-vm",
       httpRpcUrl: "https://example.invalid/",
       depository: "rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv",
-      hubChainId: "1",
     },
     // Invalid config for the rejection test: depository as an X-address (must be classic).
     "xrp-xaddr": {
@@ -58,14 +57,12 @@ jest.mock("../../../../src/common/chains", () => {
       vmType: "xrp-vm",
       httpRpcUrl: "https://example.invalid/",
       depository: "XV3oNHx95sqdCkTDCBCVsVeuBmvh2du1vBfJR24EqdgwHDW",
-      hubChainId: "1",
     },
   };
   return {
     getChains: async () => chains,
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) => chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) => chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),

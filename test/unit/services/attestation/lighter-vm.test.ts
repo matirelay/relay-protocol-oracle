@@ -20,13 +20,15 @@ const testDepositoryAddress = "460491";
 const testAdditionalDepositoryAddress = "460492";
 const testRecipientAddress = "462196";
 
+// Lighter tx ids are 40-byte hashes, hex without the 0x prefix
+const randomLighterTxId = () => randomHex(40).slice(2);
+
 jest.mock("../../../../src/common/chains", () => {
   const chains: Record<string, Chain> = {
     lighter: {
       id: "lighter",
       vmType: "lighter-vm",
       httpRpcUrl: "https://api.lighter.xyz",
-      hubChainId: "1",
       depository: "460491",
       additionalDepositories: ["460492"],
       additionalData: {
@@ -42,8 +44,6 @@ jest.mock("../../../../src/common/chains", () => {
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) =>
       chainId === "base" ? "ethereum-vm" : chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) =>
-      chainId === "base" ? "8453" : chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -117,8 +117,21 @@ describe("LighterVmAttestor", () => {
       jest.clearAllMocks();
     });
 
+    it("should reject a non-canonical transaction id", async () => {
+      const attestor = new LighterVmAttestor();
+      await expect(
+        attestor.getSolverPaidAmount("lighter", `${randomLighterTxId()} `, {
+          currency: "0",
+          recipient: testRecipientAddress,
+          orderId: `0x${"ab".repeat(32)}`,
+          extraData: "0x",
+          deadline: 9999999999,
+        }),
+      ).rejects.toThrow(/Invalid Lighter transaction id/);
+    });
+
     it("should correctly verify USDC payment amount for EXECUTED and COMMITTED transactions", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
       const paymentAmount = 1000000; // 1 USDC (6 decimals)
 
       const mockTransaction = {
@@ -188,7 +201,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw error when transaction is not found", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       setupRpcMock({
         transactionApi: {
@@ -215,7 +228,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw error when transaction is not committed or executed", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const mockTransaction = {
         hash: transactionId,
@@ -250,7 +263,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw error when transaction exceeds deadline", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
       const queuedAt = 1763298993375;
 
       const mockTransaction = {
@@ -293,7 +306,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw error when payment cannot be detected", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
       const attestor = new LighterVmAttestor();
 
       // Test case 1: Wrong recipient
@@ -365,8 +378,49 @@ describe("LighterVmAttestor", () => {
       jest.clearAllMocks();
     });
 
+    it("should reject transaction ids which alias to the same transaction", async () => {
+      const transactionId = randomLighterTxId();
+      const transferInfo = createTransferTxInfo({
+        FromAccountIndex: 123456,
+        ToAccountIndex: Number(testDepositoryAddress),
+      });
+
+      // Mock a valid deposit so only the id check can reject these
+      setupRpcMock({
+        transactionApi: {
+          getTransaction: jest.fn(() =>
+            Promise.resolve({
+              hash: transactionId,
+              type: TransactionType.TRANSFER,
+              status: TransactionStatus.EXECUTED,
+              queued_at: 1763298993375,
+              info: JSON.stringify(transferInfo),
+            }),
+          ),
+        },
+      });
+
+      const attestor = new LighterVmAttestor();
+      for (const aliased of [
+        `${transactionId} `,
+        `${transactionId}\n`,
+        `${transactionId}\t`,
+        `${transactionId}%00`,
+        `${transactionId}deadbeef`,
+        `0x${transactionId}`,
+      ]) {
+        await expect(
+          attestor.getDepositoryDepositMessages("lighter", aliased),
+        ).rejects.toThrow(/Invalid Lighter transaction id/);
+      }
+
+      await expect(
+        attestor.getDepositoryDepositMessages("lighter", transactionId),
+      ).resolves.toHaveLength(1);
+    });
+
     it("should return deposit message for Transfer TO depository (USDC perps)", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
       const depositorAccount = "123456";
 
       const transferInfo = createTransferTxInfo({
@@ -409,7 +463,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should return deposit message for Transfer TO an additional depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
       const depositorAccount = "123456";
 
       const transferInfo = createTransferTxInfo({
@@ -446,7 +500,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should return deposit message for Transfer TO depository (USDC spot)", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -482,7 +536,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should return deposit message for Transfer TO depository (ETH spot)", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -518,7 +572,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should still attest deposit with unknown asset/route combo", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -556,7 +610,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should use zeroHash for depositId when Memo is not 32 bytes (non-solver deposit)", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -594,7 +648,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should use zeroHash for depositId when Memo has last 12 bytes as zero (non-Relay memo)", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       // 20-byte address + 12 zero bytes (e.g. fast withdrawal memo)
       const memo = [
@@ -636,7 +690,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw when transaction has no queued_at", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -664,7 +718,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should return empty array for Transfer NOT to depository", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       const transferInfo = createTransferTxInfo({
         FromAccountIndex: 123456,
@@ -695,7 +749,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should return empty array for non-Transfer tx type", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       setupRpcMock({
         transactionApi: {
@@ -721,7 +775,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw for missing transaction", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       setupRpcMock({
         transactionApi: {
@@ -736,7 +790,7 @@ describe("LighterVmAttestor", () => {
     });
 
     it("should throw for reverted transaction", async () => {
-      const transactionId = randomHex(32);
+      const transactionId = randomLighterTxId();
 
       setupRpcMock({
         transactionApi: {
@@ -762,6 +816,21 @@ describe("LighterVmAttestor", () => {
   describe("getDepositoryWithdrawalMessage", () => {
     beforeEach(() => {
       jest.clearAllMocks();
+    });
+
+    it("should reject a non-canonical fallback transaction id", async () => {
+      const encodedWithdrawal = encodeWithdrawal(
+        createMatchingWithdrawal(createTransferTxInfo()),
+      );
+
+      const attestor = new LighterVmAttestor();
+      await expect(
+        attestor.getDepositoryWithdrawalMessage(
+          "lighter",
+          encodedWithdrawal,
+          `${randomLighterTxId()}\n`,
+        ),
+      ).rejects.toThrow(/Invalid Lighter transaction id/);
     });
 
     it("should return EXECUTED when matching tx found via Explorer API scan", async () => {
@@ -791,6 +860,7 @@ describe("LighterVmAttestor", () => {
           getTransaction: jest.fn(() =>
             Promise.resolve({
               type: TransactionType.TRANSFER,
+              status: TransactionStatus.EXECUTED,
               info: JSON.stringify(transferInfo),
             }),
           ),
@@ -835,6 +905,7 @@ describe("LighterVmAttestor", () => {
           getTransaction: jest.fn(() =>
             Promise.resolve({
               type: TransactionType.TRANSFER,
+              status: TransactionStatus.EXECUTED,
               info: JSON.stringify(transferInfo),
             }),
           ),
@@ -910,6 +981,51 @@ describe("LighterVmAttestor", () => {
       expect(result.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
     });
 
+    it("should return EXPIRED when an Explorer tx consumed the nonce with a different hash", async () => {
+      const transferInfo = createTransferTxInfo();
+      const decoded = createMatchingWithdrawal(transferInfo);
+      const encodedWithdrawal = encodeWithdrawal(decoded);
+      const consumingTransferInfo = {
+        ...transferInfo,
+        AssetIndex: transferInfo.AssetIndex + 1,
+      };
+
+      mockedAxios.get.mockResolvedValueOnce({
+        data: [
+          {
+            hash: "different-tx-hash",
+            status: "executed",
+            pubdata: {
+              l2_transfer_pubdata_v2: {
+                from_account_index: testDepositoryAddress,
+                to_account_index: testRecipientAddress,
+              },
+            },
+          },
+        ],
+      });
+
+      setupRpcMock({
+        transactionApi: {
+          getTransaction: jest.fn(() =>
+            Promise.resolve({
+              type: TransactionType.TRANSFER,
+              status: TransactionStatus.EXECUTED,
+              info: JSON.stringify(consumingTransferInfo),
+            }),
+          ),
+        },
+      });
+
+      const attestor = new LighterVmAttestor();
+      const result = await attestor.getDepositoryWithdrawalMessage(
+        "lighter",
+        encodedWithdrawal,
+      );
+
+      expect(result.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+    });
+
     it("should return EXECUTED via transactionId fallback when Explorer scan finds no match", async () => {
       const transferInfo = createTransferTxInfo();
       const decoded = createMatchingWithdrawal(transferInfo);
@@ -949,7 +1065,7 @@ describe("LighterVmAttestor", () => {
       const result = await attestor.getDepositoryWithdrawalMessage(
         "lighter",
         encodedWithdrawal,
-        "direct-tx-hash",
+        randomLighterTxId(),
       );
 
       expect(result.result.status).toBe(DepositoryWithdrawalStatus.EXECUTED);
@@ -981,10 +1097,113 @@ describe("LighterVmAttestor", () => {
       const result = await attestor.getDepositoryWithdrawalMessage(
         "lighter",
         encodedWithdrawal,
-        "pending-expired-tx-hash",
+        randomLighterTxId(),
       );
 
       expect(result.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+    });
+
+    it.each([
+      TransactionStatus.EXECUTED,
+      TransactionStatus.COMMITTED,
+      TransactionStatus.FAILED,
+      TransactionStatus.REJECTED,
+    ])(
+      "should return EXPIRED via transactionId fallback when a tx with status %s consumed the nonce with a different hash",
+      async (txStatus) => {
+        const transferInfo = createTransferTxInfo();
+        const decoded = createMatchingWithdrawal(transferInfo);
+        const encodedWithdrawal = encodeWithdrawal(decoded);
+        const consumingTransferInfo = {
+          ...transferInfo,
+          Amount: transferInfo.Amount + 1,
+        };
+
+        mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+        setupRpcMock({
+          transactionApi: {
+            getTransaction: jest.fn(() =>
+              Promise.resolve({
+                type: TransactionType.TRANSFER,
+                status: txStatus,
+                info: JSON.stringify(consumingTransferInfo),
+              }),
+            ),
+          },
+        });
+
+        const attestor = new LighterVmAttestor();
+        const result = await attestor.getDepositoryWithdrawalMessage(
+          "lighter",
+          encodedWithdrawal,
+          randomLighterTxId(),
+        );
+
+        expect(result.result.status).toBe(DepositoryWithdrawalStatus.EXPIRED);
+      },
+    );
+
+    it("should keep a different hash PENDING when its API key, status, currency, and amount do not consume the nonce", async () => {
+      const transferInfo = createTransferTxInfo();
+      const decoded = createMatchingWithdrawal(transferInfo);
+      const encodedWithdrawal = encodeWithdrawal(decoded);
+      const getTransaction = jest
+        .fn<() => Promise<unknown>>()
+        .mockResolvedValueOnce({
+          type: TransactionType.TRANSFER,
+          status: TransactionStatus.EXECUTED,
+          info: JSON.stringify({
+            ...transferInfo,
+            ApiKeyIndex: transferInfo.ApiKeyIndex + 1,
+          }),
+        })
+        .mockResolvedValueOnce({
+          type: TransactionType.TRANSFER,
+          status: TransactionStatus.PENDING,
+          info: JSON.stringify({
+            ...transferInfo,
+            Amount: transferInfo.Amount + 1,
+          }),
+        })
+        .mockResolvedValueOnce({
+          type: TransactionType.TRANSFER,
+          status: TransactionStatus.EXECUTED,
+          info: JSON.stringify({
+            ...transferInfo,
+            ToAccountIndex: transferInfo.ToAccountIndex + 1,
+          }),
+        });
+
+      mockedAxios.get.mockResolvedValue({ data: [] });
+      setupRpcMock({ transactionApi: { getTransaction } });
+
+      const attestor = new LighterVmAttestor();
+      const differentApiKeyResult = await attestor.getDepositoryWithdrawalMessage(
+        "lighter",
+        encodedWithdrawal,
+        randomLighterTxId(),
+      );
+      const pendingResult = await attestor.getDepositoryWithdrawalMessage(
+        "lighter",
+        encodedWithdrawal,
+        randomLighterTxId(),
+      );
+      const sameValueResult = await attestor.getDepositoryWithdrawalMessage(
+        "lighter",
+        encodedWithdrawal,
+        randomLighterTxId(),
+      );
+
+      expect(differentApiKeyResult.result.status).toBe(
+        DepositoryWithdrawalStatus.PENDING,
+      );
+      expect(pendingResult.result.status).toBe(
+        DepositoryWithdrawalStatus.PENDING,
+      );
+      expect(sameValueResult.result.status).toBe(
+        DepositoryWithdrawalStatus.PENDING,
+      );
     });
 
     it("should return PENDING when no match found", async () => {
@@ -1009,6 +1228,5 @@ describe("LighterVmAttestor", () => {
 
       expect(result.result.status).toBe(DepositoryWithdrawalStatus.PENDING);
     });
-
   });
 });

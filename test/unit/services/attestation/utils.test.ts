@@ -3,47 +3,9 @@ import { VmType } from "@relay-protocol/settlement-sdk";
 
 import { Chain } from "../../../../src/common/chains";
 import {
-  cartesianProduct,
   resolveAmountTieredFinality,
   selectFinalizationThreshold,
 } from "../../../../src/services/attestation/utils";
-
-describe("cartesianProduct", () => {
-  it("returns a single empty combination for no lists", () => {
-    expect(cartesianProduct([])).toEqual([[]]);
-  });
-
-  it("returns one combination when every slot has a single option", () => {
-    expect(cartesianProduct([["a"], ["b"], ["c"]])).toEqual([["a", "b", "c"]]);
-  });
-
-  it("expands a single re-signed slot into two combinations", () => {
-    // One input signed twice (b1, b2) -> two candidate combinations.
-    expect(cartesianProduct([["a"], ["b1", "b2"]])).toEqual([
-      ["a", "b1"],
-      ["a", "b2"],
-    ]);
-  });
-
-  it("produces the product of all slot sizes", () => {
-    // Two inputs each signed twice -> 2 * 2 = 4 combinations.
-    const combinations = cartesianProduct([
-      ["a1", "a2"],
-      ["b1", "b2"],
-    ]);
-    expect(combinations).toHaveLength(4);
-    expect(combinations).toEqual([
-      ["a1", "b1"],
-      ["a1", "b2"],
-      ["a2", "b1"],
-      ["a2", "b2"],
-    ]);
-  });
-
-  it("collapses to no combinations when any slot is empty", () => {
-    expect(cartesianProduct([["a"], []])).toEqual([]);
-  });
-});
 
 const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
@@ -219,7 +181,7 @@ describe("resolveAmountTieredFinality", () => {
       DEFAULTS,
     );
     expect(r.required).toEqual({ finalizationBlocks: 1, finalizationTime: 1 });
-    expect(r.usedDefaults).toBe(false);
+    expect(r.mode).toBe("fast");
     expect(r.tiers[0]?.feeBps).toBe("100");
   });
 
@@ -230,7 +192,7 @@ describe("resolveAmountTieredFinality", () => {
       DEFAULTS,
     );
     expect(r.required).toEqual(DEFAULTS);
-    expect(r.usedDefaults).toBe(true);
+    expect(r.mode).toBe("slow");
     expect(r.tiers[0]).toBeNull();
   });
 
@@ -241,9 +203,50 @@ describe("resolveAmountTieredFinality", () => {
       DEFAULTS,
     );
     expect(r.required).toEqual(DEFAULTS);
-    expect(r.usedDefaults).toBe(true);
+    expect(r.mode).toBe("slow");
     expect(r.tiers[0]?.feeBps).toBe("100");
     expect(r.tiers[1]).toBeNull();
+  });
+
+  it("a tier exactly equal to the defaults in both dimensions resolves slow", () => {
+    const chain = makeChain({
+      fastMode: {
+        finalityTiers: {
+          [USDC]: [
+            {
+              maxAmount: "1000",
+              finalizationBlocks: DEFAULTS.finalizationBlocks,
+              finalizationTime: DEFAULTS.finalizationTime,
+              feeBps: "100",
+            },
+          ],
+        },
+      },
+    });
+    const r = resolveAmountTieredFinality(chain, [deposit("500")], DEFAULTS);
+    expect(r.mode).toBe("slow");
+  });
+
+  it("a tier slower than the default in one dimension resolves slow", () => {
+    const chain = makeChain({
+      fastMode: {
+        finalityTiers: {
+          [USDC]: [
+            {
+              maxAmount: "1000",
+              finalizationBlocks: 1,
+              finalizationTime: 600,
+              feeBps: "100",
+            },
+          ],
+        },
+      },
+    });
+    const r = resolveAmountTieredFinality(chain, [deposit("500")], DEFAULTS);
+    // The slow resolution reverts to the default finality — the tier's lower
+    // block count must not weaken the gate
+    expect(r.required).toEqual(DEFAULTS);
+    expect(r.mode).toBe("slow");
   });
 
   it("multiple tiered deposits take the strictest threshold, per-deposit fee", () => {
@@ -254,7 +257,7 @@ describe("resolveAmountTieredFinality", () => {
     );
     // deposit1 → tier1 (1/1); deposit2 → tier2 (3/5); strictest = max(1,3)/max(1,5)
     expect(r.required).toEqual({ finalizationBlocks: 3, finalizationTime: 5 });
-    expect(r.usedDefaults).toBe(false);
+    expect(r.mode).toBe("fast");
     expect(r.tiers[0]?.feeBps).toBe("100");
     expect(r.tiers[1]?.feeBps).toBe("200");
   });

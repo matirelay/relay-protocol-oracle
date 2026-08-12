@@ -50,7 +50,7 @@ export default {
     return reply.send({
       chains: Object.values(chains).map((chain) => ({
         id: chain.id,
-        vmType: chain.vmType as Exclude<typeof chain.vmType, "sui-vm">,
+        vmType: chain.vmType,
         depository: chain.depository,
       })),
     });

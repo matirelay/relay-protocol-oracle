@@ -1,4 +1,5 @@
 import {
+  Transaction,
   TransactionType,
   TransactionStatus,
 } from "@reservoir0x/lighter-ts-sdk";
@@ -26,6 +27,8 @@ const VM_TYPE = "lighter-vm";
 
 // Buffer for ExpiredAt check to account for clock skew (60 seconds)
 const EXPIRY_BUFFER_MS = 60 * 1000;
+
+const TX_ID_REGEX = /^[0-9a-fA-F]{80}$/;
 
 type TransferTxInfo = {
   FromAccountIndex: number;
@@ -64,6 +67,8 @@ export class LighterVmAttestor extends VmAttestor {
     transactionId: string,
   ): Promise<EnhancedDepositoryDepositMessage[]> {
     const trackingId = getTrackingId();
+
+    this._requireCanonicalTransactionId(transactionId);
 
     const chain = await getChain(chainId);
     const depositories = this._getConfiguredDepositories(chain);
@@ -120,9 +125,7 @@ export class LighterVmAttestor extends VmAttestor {
     const transferCurrency = this._getDepositCurrency(transferInfo);
 
     if (!txDetail.queued_at) {
-      throw externalError(
-        `Missing queued_at for transaction ${transactionId}`,
-      );
+      throw externalError(`Missing queued_at for transaction ${transactionId}`);
     }
     const timestamp = Math.floor(txDetail.queued_at / 1000).toString();
 
@@ -154,6 +157,10 @@ export class LighterVmAttestor extends VmAttestor {
   ): Promise<DepositoryWithdrawalMessage> {
     const trackingId = getTrackingId();
 
+    if (transactionId !== undefined) {
+      this._requireCanonicalTransactionId(transactionId);
+    }
+
     const chain = await getChain(chainId);
 
     const decodedWithdrawal = decodeWithdrawal(
@@ -174,15 +181,14 @@ export class LighterVmAttestor extends VmAttestor {
     // 1. Scan recent depository Transfer txs via Explorer API
     const explorerApiUrl = chain.additionalData?.explorerApiUrl;
     const PAGE_SIZE = 100;
-    const MAX_PAGES = 3;
-    let found = false;
-    let rpcCallCount = 0;
+    const MAX_PAGES = 20;
 
+    let found = false;
     for (let page = 0; page < MAX_PAGES && !found && explorerApiUrl; page++) {
       try {
         await logRpcUsage(chainId, "explorerAccountLogs", trackingId);
         const response: { data: ExplorerLogEntry[] } = await axios.get(
-          `${explorerApiUrl}/accounts/${depository}/logs` +
+          `${explorerApiUrl}/api/accounts/${depository}/logs` +
             `?pub_data_type=L2Transfer%2CL2TransferV2&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`,
           {
             headers: {
@@ -195,48 +201,55 @@ export class LighterVmAttestor extends VmAttestor {
         );
 
         const logs: ExplorerLogEntry[] = response.data;
-        if (!logs?.length) break;
+        if (!logs?.length) {
+          break;
+        }
 
+        let currentNonce: number | undefined;
         for (const log of logs) {
-          // Pre-filter by pubdata: only txs FROM depository TO withdrawal recipient
+          // Pre-filter by pubdata: only txs FROM the depository
+          // A transfer to another recipient can still consume the withdrawal's nonce
           const pd =
             log.pubdata?.l2_transfer_pubdata ||
             log.pubdata?.l2_transfer_pubdata_v2;
-          if (
-            !pd ||
-            pd.from_account_index !== depository ||
-            pd.to_account_index !== parameters.toAccountIndex
-          ) {
+          if (!pd || pd.from_account_index !== depository) {
             continue;
           }
 
           // Full tx detail needed for L1 message hash matching
-          rpcCallCount++;
-          await logRpcUsage(chainId, "getTransaction", trackingId);
-          const txDetail = await transactionApi.getTransaction({
-            by: "hash",
-            value: log.hash,
-          });
+          let txDetail: Transaction | undefined;
           if (
-            txDetail?.type === TransactionType.TRANSFER &&
-            txDetail.info
+            !currentNonce ||
+            [currentNonce - 1, currentNonce, currentNonce + 1].includes(
+              Number(parameters.nonce),
+            )
           ) {
+            await logRpcUsage(chainId, "getTransaction", trackingId);
+            txDetail = await transactionApi.getTransaction({
+              by: "hash",
+              value: log.hash,
+            });
+
+            currentNonce = txDetail.nonce;
+          } else {
+            currentNonce--;
+          }
+
+          if (txDetail?.type === TransactionType.TRANSFER && txDetail.info) {
             const transferInfo: TransferTxInfo = JSON.parse(txDetail.info);
             const txMsgHash = this._getTransferMessageHash(
               transferInfo,
               parameters.lighterChainId,
             );
             if (txMsgHash === withdrawalId) {
-              if (log.status === "executed") {
-                // Explorer confirms executed → EXECUTED directly
-                status = DepositoryWithdrawalStatus.EXECUTED;
-              } else {
-                // Non-executed → use getTransaction status for granular check
-                status = this._getWithdrawalStatus(
-                  txDetail.status,
-                  transferInfo,
-                );
-              }
+              status = this._getWithdrawalStatus(txDetail.status, transferInfo);
+              found = true;
+              break;
+            } else if (
+              this._hasMatchingNonce(transferInfo, parameters, txDetail.status)
+            ) {
+              // The account/API-key nonce was included with another payload so this signed withdrawal can no longer execute
+              status = DepositoryWithdrawalStatus.EXPIRED;
               found = true;
               break;
             }
@@ -251,13 +264,6 @@ export class LighterVmAttestor extends VmAttestor {
       }
     }
 
-    if (rpcCallCount > 0) {
-      logger.info(
-        "lighter-vm",
-        `Withdrawal scan: ${rpcCallCount} getTransaction calls, found=${found}`,
-      );
-    }
-
     // 2. Fallback: transactionId provided → direct lookup
     if (status === DepositoryWithdrawalStatus.PENDING && transactionId) {
       await logRpcUsage(chainId, "getTransaction", trackingId);
@@ -265,10 +271,7 @@ export class LighterVmAttestor extends VmAttestor {
         by: "hash",
         value: transactionId,
       });
-      if (
-        txDetail?.type === TransactionType.TRANSFER &&
-        txDetail.info
-      ) {
+      if (txDetail?.type === TransactionType.TRANSFER && txDetail.info) {
         const transferInfo: TransferTxInfo = JSON.parse(txDetail.info);
         const txMsgHash = this._getTransferMessageHash(
           transferInfo,
@@ -276,6 +279,11 @@ export class LighterVmAttestor extends VmAttestor {
         );
         if (txMsgHash === withdrawalId) {
           status = this._getWithdrawalStatus(txDetail.status, transferInfo);
+        } else if (
+          this._hasMatchingNonce(transferInfo, parameters, txDetail.status)
+        ) {
+          // The account/API-key nonce was included with another payload so this signed withdrawal can no longer execute
+          status = DepositoryWithdrawalStatus.EXPIRED;
         }
       }
     }
@@ -305,6 +313,8 @@ export class LighterVmAttestor extends VmAttestor {
     },
   ): Promise<bigint> {
     const trackingId = getTrackingId();
+
+    this._requireCanonicalTransactionId(transactionId);
 
     const { transactionApi } = await httpRpc(chainId);
 
@@ -436,6 +446,15 @@ export class LighterVmAttestor extends VmAttestor {
     return depository;
   }
 
+  // Validate the transaction id against Lighter's canonical hash format.
+  private _requireCanonicalTransactionId(transactionId: string) {
+    if (!TX_ID_REGEX.test(transactionId)) {
+      throw externalError(
+        `Invalid Lighter transaction id ${transactionId}: expected 80 hex chars`,
+      );
+    }
+  }
+
   private _parseDepositoryAccountIndex(accountIndex: string): bigint {
     if (!/^\d+$/.test(accountIndex)) {
       throw externalError(`Invalid depository account index: ${accountIndex}`);
@@ -490,12 +509,14 @@ export class LighterVmAttestor extends VmAttestor {
     ) {
       return DepositoryWithdrawalStatus.EXECUTED;
     }
+
     if (
       txStatus === TransactionStatus.FAILED ||
       txStatus === TransactionStatus.REJECTED
     ) {
       return DepositoryWithdrawalStatus.EXPIRED;
     }
+
     // PENDING/QUEUED — check if past deadline
     if (
       transferInfo.ExpiredAt &&
@@ -503,7 +524,36 @@ export class LighterVmAttestor extends VmAttestor {
     ) {
       return DepositoryWithdrawalStatus.EXPIRED;
     }
+
     return DepositoryWithdrawalStatus.PENDING;
+  }
+
+  private _hasMatchingNonce(
+    transferInfo: TransferTxInfo,
+    parameters: DecodedLighterVmWithdrawal["withdrawal"]["parameters"],
+    txStatus: number | string,
+  ): boolean {
+    // For safety, compare the exact currency and amount and only expire the
+    // withdrawal when either value differs in the nonce-consuming transaction
+    const hasDifferentCurrency =
+      transferInfo.AssetIndex.toString() !== parameters.assetIndex;
+    const hasDifferentAmount =
+      transferInfo.Amount.toString() !== parameters.amount;
+
+    const hasFinalStatus =
+      txStatus === TransactionStatus.EXECUTED ||
+      txStatus === TransactionStatus.COMMITTED ||
+      txStatus === TransactionStatus.FAILED ||
+      txStatus === TransactionStatus.REJECTED;
+
+    return (
+      hasFinalStatus &&
+      transferInfo.FromAccountIndex.toString() ===
+        parameters.fromAccountIndex &&
+      transferInfo.ApiKeyIndex.toString() === parameters.apiKeyIndex &&
+      transferInfo.Nonce.toString() === parameters.nonce &&
+      (hasDifferentCurrency || hasDifferentAmount)
+    );
   }
 
   /**

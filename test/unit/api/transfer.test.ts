@@ -1,7 +1,7 @@
 import { describe, expect, it, jest, beforeEach } from "@jest/globals";
 
 import endpoint from "../../../src/api/attestations/transfer/v1";
-import { verifyOwnerSignature } from "../../../src/common/signature-verification";
+import { verifyTransferSignature } from "../../../src/common/signature-verification";
 import { signExecutionMessage } from "../../../src/common/signer";
 
 const ALIAS = "0xAliasOwner00000000000000000000000000000abcd";
@@ -22,7 +22,7 @@ jest.mock("../../../src/common/chains", () => ({
 }));
 
 jest.mock("../../../src/common/signature-verification", () => ({
-  verifyOwnerSignature: jest.fn(async () => undefined),
+  verifyTransferSignature: jest.fn(async () => undefined),
 }));
 
 jest.mock("../../../src/common/signer", () => ({
@@ -82,8 +82,8 @@ describe("POST /attestations/transfer/v1", () => {
     );
 
     // The owner signature is verified before anything is signed.
-    expect(verifyOwnerSignature).toHaveBeenCalledWith({
-      data: { ...body(), operation: "transfer" },
+    expect(verifyTransferSignature).toHaveBeenCalledWith({
+      data: body(),
       signature: body().ownerSignature,
     });
 
@@ -104,7 +104,7 @@ describe("POST /attestations/transfer/v1", () => {
   });
 
   it("propagates an invalid owner signature and does not sign", async () => {
-    (verifyOwnerSignature as jest.Mock).mockImplementationOnce(
+    (verifyTransferSignature as jest.Mock).mockImplementationOnce(
       async () => {
         throw new Error("Invalid signature");
       },

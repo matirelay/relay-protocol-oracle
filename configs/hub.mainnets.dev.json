@@ -7,12 +7,8 @@
   "oracleVersion": "2",
   "oracleMultisigAddress": "0xf62db37a0d07f7226292ce360225a329510a7f3a",
   "genericMappingAddress": "0xffb396f168d5116972a1e5cceea323b2622d288c",
+  "withdrawGasPayerAddress": "0x6c30a570d602515821de568b15a6214a5bf7fa5f",
   "allocatorAddress": "0x95bb2652BaA8a1177f750d92384527c5814f5254",
   "executorAddress": "0x8e4740962E0B8fF64A3AE44409572F33f34D97AE",
-  "depositAddressManagerAddress": "0xc4d8afb323c316dd7c91ddd4f818d5accd0661e3",
-  "auroraHttpRpcUrl": "https://mainnet.aurora.dev",
-  "auroraEvmChainId": "1313161554",
-  "auroraAllocatorAddress": "0x45348c213bf7ddb8e45f34ca4f333307a78ecb9a",
-  "auroraAllocatorSpenderAddress": "0xd218a01a0c2671f99c37e5fdcbb82f538aab0d84",
-  "auroraOracleMultisigAddress": "0x76176a0683acd9d4803f7b25d1d38ed4bf33db14"
+  "depositAddressManagerAddress": "0xc4d8afb323c316dd7c91ddd4f818d5accd0661e3"
 }

@@ -28,6 +28,8 @@ import { httpRpc, httpTronRpc } from "../../../../common/vm/tron-vm/rpc";
 
 const VM_TYPE = "tron-vm";
 
+const TX_ID_REGEX = /^[0-9a-f]{64}$/;
+
 export const fromHexAddress = (address: string) => {
   return tronweb.utils.address.fromHex(
     address.replace("0x", tronweb.utils.address.ADDRESS_PREFIX),
@@ -45,6 +47,8 @@ export class TronVmAttestor extends VmAttestor {
     chainId: string,
     transactionId: string,
   ): Promise<EnhancedDepositoryDepositMessage[]> {
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
 
     // Ensure the transaction was successfully included
@@ -312,6 +316,8 @@ export class TronVmAttestor extends VmAttestor {
       deadline: number;
     },
   ): Promise<bigint> {
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
 
     // Ensure the transaction was successfully included
@@ -429,6 +435,15 @@ export class TronVmAttestor extends VmAttestor {
     _extraData: string,
   ): Promise<boolean> {
     throw internalError("Not implemented");
+  }
+
+  // Validate the transaction id against Tron's canonical hash format.
+  private _requireCanonicalTransactionId(transactionId: string) {
+    if (!TX_ID_REGEX.test(transactionId)) {
+      throw externalError(
+        `Invalid tron-vm transaction id ${transactionId}: expected 64 lowercase hex chars without 0x prefix`,
+      );
+    }
   }
 
   private _DEFAULT_FINALIZATION_BLOCKS = 10;

@@ -4,7 +4,17 @@ import bs58 from "bs58";
 import { ed25519 } from "@noble/curves/ed25519";
 import { Verifier as Bip322Verifier } from "bip322-js";
 import { Address as TonAddress } from "@ton/core";
-import { Address, Hex, keccak256, recoverAddress, verifyMessage } from "viem";
+import {
+  Address,
+  createPublicClient,
+  Hex,
+  http,
+  keccak256,
+  recoverAddress,
+  SignableMessage,
+  verifyMessage,
+} from "viem";
+import { verifyMessage as verifyMessageOnchain } from "viem/actions";
 import {
   decode as decodeXrplTx,
   encodeForSigning as encodeXrplForSigning,
@@ -25,12 +35,12 @@ import { toHexAddress } from "../services/attestation/vm/tron-vm";
 import { httpRpc as lighterHttpRpc } from "./vm/lighter-vm/rpc";
 import { httpRpc as tonHttpRpc } from "./vm/ton-vm/rpc";
 
-export type OwnerSignatureOperation = "withdrawal" | "transfer";
+type SignatureMetadata = {
+  // ton-vm TonConnect signData envelope params; verified separately from the digest.
+  "ton-vm"?: { timestamp: number; domain: string };
+};
 
-export type OwnerSignatureData = {
-  // Prevent a signature for one action from authorizing another action with
-  // otherwise identical parameters.
-  operation: OwnerSignatureOperation;
+type BaseSignatureData = {
   chainId: string;
   currency: string;
   amount: string;
@@ -39,47 +49,121 @@ export type OwnerSignatureData = {
   recipient: string;
   nonce: string;
   additionalData?: Record<string, unknown>;
-  // ton-vm TonConnect signData envelope params; verify the signature, not hashed into the digest.
-  signatureMetadata?: {
-    "ton-vm"?: { timestamp: number; domain: string };
-  };
+  signatureMetadata?: SignatureMetadata;
 };
 
-// Verifies that `owner` (on `ownerChainId`) authorized an operation over the
-// given params, using that chain's native signing scheme. Used for any
-// owner-authorized action on the owner's funds/alias (withdrawals, transfers,
-// etc.) — not withdrawals specifically.
-export const verifyOwnerSignature = async ({
+export type WithdrawalSignatureData = BaseSignatureData;
+
+export type TransferSignatureData = BaseSignatureData;
+
+export type GasPaymentSignatureData = BaseSignatureData & {
+  feeCurrency: string;
+  feeAmount: string;
+};
+
+type SignatureOperation = "withdrawal" | "transfer" | "gas-payment";
+
+const createSignaturePayload = <Operation extends SignatureOperation>(
+  operation: Operation,
+  data: BaseSignatureData,
+) => ({
+  operation,
+  chainId: data.chainId,
+  currency: data.currency,
+  amount: data.amount,
+  ownerChainId: data.ownerChainId,
+  owner: data.owner,
+  recipient: data.recipient,
+  nonce: data.nonce,
+  additionalData: data.additionalData,
+});
+
+const createWithdrawalSignaturePayload = (data: WithdrawalSignatureData) =>
+  createSignaturePayload("withdrawal", data);
+
+const createTransferSignaturePayload = (data: TransferSignatureData) =>
+  createSignaturePayload("transfer", data);
+
+const createGasPaymentSignaturePayload = (data: GasPaymentSignatureData) => ({
+  ...createSignaturePayload("gas-payment", data),
+  feeCurrency: data.feeCurrency,
+  feeAmount: data.feeAmount,
+});
+
+type SignaturePayload =
+  | ReturnType<typeof createWithdrawalSignaturePayload>
+  | ReturnType<typeof createTransferSignaturePayload>
+  | ReturnType<typeof createGasPaymentSignaturePayload>;
+
+type SignatureVerification<T> = {
+  data: T;
+  signature: string;
+};
+
+export const verifyWithdrawalSignature = (
+  verification: SignatureVerification<WithdrawalSignatureData>,
+) =>
+  verifySignature({
+    data: verification.data,
+    payload: createWithdrawalSignaturePayload(verification.data),
+    signature: verification.signature,
+  });
+
+export const verifyTransferSignature = (
+  verification: SignatureVerification<TransferSignatureData>,
+) =>
+  verifySignature({
+    data: verification.data,
+    payload: createTransferSignaturePayload(verification.data),
+    signature: verification.signature,
+  });
+
+export const verifyGasPaymentSignature = (
+  verification: SignatureVerification<GasPaymentSignatureData>,
+) =>
+  verifySignature({
+    data: verification.data,
+    payload: createGasPaymentSignaturePayload(verification.data),
+    signature: verification.signature,
+  });
+
+// Verifies an operation-bound signature using the owner's chain-native signing
+// scheme. Public operation-specific methods above provide domain separation
+// without exposing the operation discriminator to callers.
+const verifySignature = async ({
   data,
+  payload,
   signature,
 }: {
-  data: OwnerSignatureData;
+  data: BaseSignatureData;
+  payload: SignaturePayload;
   signature: string;
 }) => {
   const ownerChain = await getChain(data.ownerChainId);
+  const digest = computeDigest(payload);
 
   switch (ownerChain.vmType) {
     case "ethereum-vm":
     case "hyperliquid-vm":
-      return verifyEvmPersonalSign(data, signature);
+      return verifyEvmPersonalSign(data, digest, signature);
 
     case "tron-vm":
-      return verifyTronMessage(data, signature);
+      return verifyTronMessage(data, digest, signature);
 
     case "solana-vm":
-      return verifySolanaEd25519(data, signature);
+      return verifySolanaEd25519(data, digest, signature);
 
     case "bitcoin-vm":
-      return verifyBitcoinMessage(data, signature);
+      return verifyBitcoinMessage(data, digest, signature);
 
     case "lighter-vm":
-      return verifyLighterPersonalSign(data, signature);
+      return verifyLighterPersonalSign(data, digest, signature);
 
     case "ton-vm":
-      return verifyTonSignData(data, signature, ownerChain);
+      return verifyTonSignData(data, digest, signature, ownerChain);
 
     case "xrp-vm":
-      return verifyXrpSignedTxBlob(data, signature);
+      return verifyXrpSignedTxBlob(data, digest, signature);
 
     default:
       throw externalError(
@@ -91,42 +175,84 @@ export const verifyOwnerSignature = async ({
 // All VMs use the same digest: SHA256(json-stable-stringify(params)).
 // `operation` provides domain separation between owner-authorized actions.
 // Each VM signs this digest using its native signing method.
-const computeDigest = (data: OwnerSignatureData): string =>
+const computeDigest = (payload: SignaturePayload): string =>
   crypto
     .createHash("sha256")
-    .update(
-      stringify({
-        operation: data.operation,
-        chainId: data.chainId,
-        currency: data.currency,
-        amount: data.amount,
-        ownerChainId: data.ownerChainId,
-        owner: data.owner,
-        recipient: data.recipient,
-        nonce: data.nonce,
-        additionalData: data.additionalData,
-      })!,
-    )
+    .update(stringify(payload)!)
     .digest()
     .toString("hex");
 
 // EVM/Hyperliquid: personal_sign over raw SHA256 bytes.
 // `address` defaults to `data.owner`; pass an override when owner is not the
 // signing EVM address (e.g. lighter-vm, where owner is the L2 account index).
+// Smart-contract wallets (e.g. Safe multisigs) are also supported: if offline
+// ECDSA recovery fails, the signature is verified via EIP-1271
+// `isValidSignature` on the owner chain (viem's RPC-based verifyMessage,
+// which also covers ERC-6492 counterfactual wallets). Only EVM owner chains
+// qualify — lighter-vm delegates here, but its configured httpRpcUrl is the
+// Lighter API rather than an EVM node.
 const verifyEvmPersonalSign = async (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
   address: string = data.owner,
 ) => {
-  const digest = computeDigest(data);
+  // Wallets differ in how they EIP-191-encode the digest for personal_sign:
+  // most sign the raw 32 bytes, but some (e.g. Safe{Wallet}) treat the hex
+  // string as UTF-8 text. Both encodings bind the exact same payload, so
+  // accept either.
+  const messages: SignableMessage[] = [
+    { raw: `0x${digest}` as Hex },
+    `0x${digest}`,
+  ];
 
-  const isSignatureValid = await verifyMessage({
-    address: address as Address,
-    message: {
-      raw: `0x${digest}`,
-    },
-    signature: signature as Hex,
-  });
+  // Offline ECDSA fast path — covers EOA owners without any RPC dependency.
+  let isSignatureValid = false;
+  for (const message of messages) {
+    try {
+      isSignatureValid = await verifyMessage({
+        address: address as Address,
+        message,
+        signature: signature as Hex,
+      });
+    } catch {
+      // Not a recoverable ECDSA signature (e.g. an EIP-1271 contract-wallet
+      // blob) — fall through to on-chain verification below.
+    }
+    if (isSignatureValid) {
+      break;
+    }
+  }
+
+  if (!isSignatureValid) {
+    const ownerChain = await getChain(data.ownerChainId);
+    const isEvmOwnerChain =
+      ownerChain.vmType === "ethereum-vm" ||
+      ownerChain.vmType === "hyperliquid-vm";
+    if (isEvmOwnerChain && ownerChain.httpRpcUrl) {
+      const client = createPublicClient({
+        transport: http(ownerChain.httpRpcUrl),
+      });
+      for (const message of messages) {
+        try {
+          isSignatureValid = await verifyMessageOnchain(client, {
+            address: address as Address,
+            message,
+            signature: signature as Hex,
+          });
+        } catch (error) {
+          logger.warn(
+            "signature-verification",
+            `EIP-1271 signature verification error for ${address}: ${error}`,
+          );
+        }
+        if (isSignatureValid) {
+          break;
+        }
+      }
+    }
+  }
+
   if (!isSignatureValid) {
     throw externalError("Invalid signature");
   }
@@ -135,8 +261,12 @@ const verifyEvmPersonalSign = async (
 // Lighter: owner is the L2 account index (e.g. "476952"), but the signature
 // is produced by the L1 EVM owner of that account. Resolve index → l1_address
 // via Lighter API, then delegate to the EVM personal_sign verifier.
+// EOA owners only: the lighter-vm chain config's httpRpcUrl is the Lighter
+// API, not an EVM node, so EIP-1271 wallets (e.g. Safe multisigs) as L1
+// owners are not supported here.
 const verifyLighterPersonalSign = async (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
 ) => {
   // Lighter's `GET /api/v1/account` returns `{ code, total, accounts: [...] }`
@@ -162,7 +292,7 @@ const verifyLighterPersonalSign = async (
     throw externalError(`Lighter account ${data.owner} has no l1_address`);
   }
 
-  return verifyEvmPersonalSign(data, signature, l1Address);
+  return verifyEvmPersonalSign(data, digest, signature, l1Address);
 };
 
 // Tron: signMessageV2 over SHA256 hex string.
@@ -179,11 +309,10 @@ const hashTronMessage = (message: string): Hex => {
 };
 
 const verifyTronMessage = async (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
 ) => {
-  const digest = computeDigest(data);
-
   try {
     const recoveredAddress = await recoverAddress({
       hash: hashTronMessage(digest),
@@ -208,10 +337,11 @@ const verifyTronMessage = async (
 // Raw 32-byte digest triggers Phantom's anti-transaction-signing check,
 // so wallets sign the 64-char hex string instead.
 const verifySolanaEd25519 = async (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
 ) => {
-  const digestBytes = Buffer.from(computeDigest(data), "utf-8");
+  const digestBytes = Buffer.from(digest, "utf-8");
 
   let pubkeyBytes: Uint8Array;
   try {
@@ -242,7 +372,8 @@ const verifySolanaEd25519 = async (
 // signatureMetadata["ton-vm"].timestamp = Unix seconds from TonConnect signData response.
 // signatureMetadata["ton-vm"].domain = domain from TonConnect signData response.
 export const verifyTonSignData = async (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
   ownerChain: Chain,
 ) => {
@@ -283,7 +414,6 @@ export const verifyTonSignData = async (
   );
 
   // Payload = the canonical operation-bound digest the user signed.
-  const digest = computeDigest(data);
   const payloadBytes = Buffer.from(digest, "utf-8");
 
   const [wcStr, addrHashHex] = data.owner.split(":");
@@ -332,10 +462,10 @@ export const verifyTonSignData = async (
 // signatures for all address types: P2PKH, P2SH-P2WPKH, P2WPKH, P2TR.
 // This covers wallets returning BIP-137 (Unisat, Xverse) and BIP-322 (OKX, Leather).
 const verifyBitcoinMessage = (
-  data: OwnerSignatureData,
+  data: BaseSignatureData,
+  digest: string,
   signature: string,
 ) => {
-  const digest = computeDigest(data);
   const sigHex = signature.startsWith("0x") ? signature.slice(2) : signature;
   const sigBase64 = Buffer.from(sigHex, "hex").toString("base64");
 
@@ -362,7 +492,11 @@ const verifyBitcoinMessage = (
 // blob itself; SigningPubKey travels inside it (XRPL account roots don't store
 // the master pubkey). Master-key signatures only: a RegularKey signer derives a
 // different address and is rejected.
-const verifyXrpSignedTxBlob = (data: OwnerSignatureData, signature: string) => {
+const verifyXrpSignedTxBlob = (
+  data: BaseSignatureData,
+  digest: string,
+  signature: string,
+) => {
   let tx: Record<string, unknown>;
   try {
     tx = decodeXrplTx(
@@ -420,7 +554,7 @@ const verifyXrpSignedTxBlob = (data: OwnerSignatureData, signature: string) => {
   const memoText = Buffer.from(memos[0].Memo?.MemoData ?? "", "hex")
     .toString("utf-8")
     .toLowerCase();
-  if (memoText !== `0x${computeDigest(data)}`) {
+  if (memoText !== `0x${digest}`) {
     throw externalError("xrp-vm authorization memo must equal the digest");
   }
 
@@ -443,4 +577,3 @@ const verifyXrpSignedTxBlob = (data: OwnerSignatureData, signature: string) => {
     throw externalError("Invalid signature");
   }
 };
-

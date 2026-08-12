@@ -4,9 +4,9 @@
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$ETHEREUM_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "1",
     "additionalData": {
-      "finalizationBlocks": 10
+      "finalizationBlocks": 10,
+      "evmChainId": "1"
     }
   },
   {
@@ -14,50 +14,57 @@
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$OPTIMISM_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "10"
+    "additionalData": {
+      "evmChainId": "10"
+    }
   },
   {
     "id": "polygon",
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$POLYGON_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "137"
+    "additionalData": {
+      "evmChainId": "137"
+    }
   },
   {
     "id": "abstract",
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$ABSTRACT_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "2741"
+    "additionalData": {
+      "evmChainId": "2741"
+    }
   },
   {
     "id": "base",
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$BASE_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "8453"
+    "additionalData": {
+      "evmChainId": "8453"
+    }
   },
   {
     "id": "arbitrum",
     "vmType": "ethereum-vm",
     "httpRpcUrl": "$ARBITRUM_RPC_URL",
     "depository": "0x5cb1de3603a71ac2f67b12bfbf095013fe4ac299",
-    "hubChainId": "42161"
+    "additionalData": {
+      "evmChainId": "42161"
+    }
   },
   {
     "id": "solana",
     "vmType": "solana-vm",
     "httpRpcUrl": "$SOLANA_RPC_URL",
-    "depository": "6TMx4zgh9Ho5DaJtaQbKbHgYLk7B6vKEoE7CfnxkqcHv",
-    "hubChainId": "50176979118388105370421134508366610418687875236156196470082648173271157915018"
+    "depository": "6TMx4zgh9Ho5DaJtaQbKbHgYLk7B6vKEoE7CfnxkqcHv"
   },
   {
     "id": "hyperliquid",
     "vmType": "hyperliquid-vm",
     "httpRpcUrl": "$HYPERLIQUID_RPC_URL",
-    "depository": "0x85594c5d28ac8bf20e6ef0b9620f648f3737607f",
-    "additionalDepositories": ["0xd47c34b9b589c4709d257a9ac55ae69a2812bad5"],
-    "hubChainId": "111378472430415857054556056192544272316610524417112732947551032542507639335976",
+    "depository": "0xd47c34b9b589c4709d257a9ac55ae69a2812bad5",
     "additionalData": {
       "proxyApiUrl": "$HYPERLIQUID_PROXY_API_URL",
       "proxyApiKey": "$HYPERLIQUID_PROXY_API_KEY"
@@ -65,11 +72,9 @@
   },
   {
     "id": "bitcoin",
-    "depository": "1MviEDGCTgEKEJ6cmfL9pBQa5GG4hujXnF",
-    "additionalDepositories": ["bc1q82jn90vgkwvknrhxpla797tu050fj0jaaaznne"],
+    "depository": "bc1q82jn90vgkwvknrhxpla797tu050fj0jaaaznne",
     "vmType": "bitcoin-vm",
     "httpRpcUrl": "$BITCOIN_RPC_URL",
-    "hubChainId": "56960375584792109628315999883526364004747792730920852649053369508622489636429",
     "additionalData": {
       "esploraCompatibleApiUrl": "$BITCOIN_ESPLORA_COMPATIBLE_API_URL",
       "blockstreamClientId": "$BITCOIN_BLOCKSTREAM_CLIENT_ID",
@@ -82,12 +87,10 @@
     "id": "lighter",
     "vmType": "lighter-vm",
     "httpRpcUrl": "$LIGHTER_RPC_URL",
-    "depository": "722011",
-    "additionalDepositories": ["730948"],
-    "hubChainId": "24751429388881399765243452447207376042614090386756997212181931796575290791450",
+    "depository": "730948",
     "additionalData": {
       "rpcApiKey": "$LIGHTER_RPC_API_KEY",
-      "explorerApiUrl": "https://explorer.elliot.ai/api"
+      "explorerApiUrl": "https://explorer.elliot.ai"
     }
   },
   {
@@ -95,7 +98,6 @@
     "vmType": "ton-vm",
     "httpRpcUrl": "$TON_RPC_URL",
     "depository": "0:f37b9f6fd97ece249cb48d9aa5d0202570ad130b7b7d4ce4dd0f4cd551b3d9bd",
-    "hubChainId": "96726042969034697820304784127401521667430272869945506471754334812043295105826",
     "additionalData": {
       "finalizationBlocks": 5,
       "signDataDomain": "relay.link"
@@ -105,7 +107,60 @@
     "id": "tron",
     "depository": "TQ3iRBjav8EBpfSVih8pPUP4ES9hk1pwD9",
     "vmType": "tron-vm",
-    "httpRpcUrl": "$TRON_RPC_URL",
-    "hubChainId": "728126428"
+    "httpRpcUrl": "$TRON_RPC_URL"
+  },
+  {
+    "id": "xrp",
+    "vmType": "xrp-vm",
+    "httpRpcUrl": "$XRP_RPC_URL",
+    "depository": "rEgPcf61jqzyxHMqStaX7GsC9Swb1srgur"
+  },
+  {
+    "id": "polygon-gateway",
+    "vmType": "gateway-vm",
+    "gateway": {
+      "source": {
+        "id": "polygon",
+        "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+        "usdc": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+        "circleDomain": 7,
+        "blockTimeSeconds": 2,
+        "withdrawalDelaySeconds": 604800,
+        "executionExpirationSeconds": 3600,
+        "maxBlockHeightTolerance": 500
+      },
+      "destinations": [
+        {
+          "id": "ethereum",
+          "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+          "usdc": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "circleDomain": 0
+        },
+        {
+          "id": "optimism",
+          "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+          "usdc": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+          "circleDomain": 2
+        },
+        {
+          "id": "polygon",
+          "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+          "usdc": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+          "circleDomain": 7
+        },
+        {
+          "id": "base",
+          "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+          "usdc": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+          "circleDomain": 6
+        },
+        {
+          "id": "arbitrum",
+          "gatewayDepository": "0x06622432e1cf0a943c1bde11fa6464ee695870d7",
+          "usdc": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+          "circleDomain": 3
+        }
+      ]
+    }
   }
 ]

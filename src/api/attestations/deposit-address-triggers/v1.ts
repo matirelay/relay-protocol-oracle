@@ -5,10 +5,9 @@ import {
   ErrorResponses,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  getPeerResponses,
 } from "../../utils";
+import { resolveOracleQuorum } from "../../quorum";
 import { signDepositAddressTriggerMessage } from "../../../common/signer";
-import { config } from "../../../config";
 import { AttestationService } from "../../../services/attestation";
 
 const Schema = {
@@ -173,30 +172,6 @@ const Schema = {
   },
 };
 
-type DepositAddressTriggerMessage = {
-  chainId: string;
-  depositAddressManager: string;
-  inputDepository: string;
-  triggerHash: string;
-};
-
-const areTriggersEqual = (
-  msg1?: DepositAddressTriggerMessage,
-  msg2?: DepositAddressTriggerMessage,
-) => {
-  if (!msg1 || !msg2) {
-    return false;
-  }
-
-  return (
-    msg1.chainId === msg2.chainId &&
-    msg1.depositAddressManager.toLowerCase() ===
-      msg2.depositAddressManager.toLowerCase() &&
-    msg1.inputDepository === msg2.inputDepository &&
-    msg1.triggerHash === msg2.triggerHash
-  );
-};
-
 export default {
   method: "POST",
   url: "/attestations/deposit-address-triggers/v1",
@@ -205,43 +180,35 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const attestationService = new AttestationService();
-    const trigger = await attestationService.attestDepositAddressTrigger(
-      req.body,
-    );
-
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (areTriggersEqual(peerData.trigger, trigger)) {
-                return peerData.trigger.signatures;
-              }
-
-              return [];
-            },
-          })
-        : [];
-
-    return reply.send({
-      trigger: {
-        chainId: trigger.chainId,
-        depositAddressManager: trigger.depositAddressManager,
-        inputDepository: trigger.inputDepository,
-        triggerHash: trigger.triggerHash,
-        signatures: [
-          await signDepositAddressTriggerMessage({
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          const trigger =
+            await new AttestationService().attestDepositAddressTrigger(
+              req.body,
+            );
+          const triggerMessage = {
             chainId: trigger.chainId,
             depositAddressManager: trigger.depositAddressManager,
             inputDepository: trigger.inputDepository,
             triggerHash: trigger.triggerHash,
-          }),
-          ...peerSignatures,
-        ],
-      },
-    });
+          };
+
+          return {
+            trigger: {
+              ...triggerMessage,
+              signatures: [
+                await signDepositAddressTriggerMessage(triggerMessage),
+              ],
+            },
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

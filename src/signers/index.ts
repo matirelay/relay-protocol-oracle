@@ -1,11 +1,11 @@
-import { Account, Hex } from "viem";
+import { Account } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { KmsSigner } from "./aws-kms";
 import { logger } from "../common/logger";
-import { config } from "../config";
+import { config, type SigningModule } from "../config";
 
-export type SigningModule = "raw-private-key" | "aws-kms";
+export type { SigningModule } from "../config";
 
 type SigningWallet = Account & Required<Pick<Account, "signMessage">>;
 
@@ -16,7 +16,7 @@ let __cachedSigningWallet: Promise<SigningWallet> | undefined;
 
 export const getSigningModule = (): SigningModule => {
   if (config.signingModule) {
-    return config.signingModule as SigningModule;
+    return config.signingModule;
   }
 
   if (!defaultWarningEmitted) {
@@ -38,15 +38,15 @@ const createSigningWallet = async (
   switch (module) {
     case "raw-private-key": {
       if (!config.ecdsaPrivateKey) {
-        throw new Error(`Missing configuration for ${module} signing moduke`);
+        throw new Error(`Missing configuration for ${module} signing module`);
       }
 
-      return privateKeyToAccount(config.ecdsaPrivateKey as Hex);
+      return privateKeyToAccount(config.ecdsaPrivateKey);
     }
 
     case "aws-kms": {
       if (!config.awsKmsSignerKeyId || !config.awsKmsSignerKeyRegion) {
-        throw new Error(`Missing configuration for ${module} signing moduke`);
+        throw new Error(`Missing configuration for ${module} signing module`);
       }
 
       const kmsSigner = new KmsSigner({

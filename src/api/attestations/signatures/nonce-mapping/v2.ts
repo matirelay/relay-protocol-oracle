@@ -1,17 +1,14 @@
 import { Type } from "@fastify/type-provider-typebox";
 
 import {
-  areGenericMappingsEqual,
   BigIntString,
   Endpoint,
   ErrorResponses,
   FastifyReplyTypeBox,
   FastifyRequestTypeBox,
-  filterSignaturesByDomain,
-  getPeerResponses,
 } from "../../../utils";
+import { resolveOracleQuorum } from "../../../quorum";
 import { signGenericMappingMessage } from "../../../../common/signer";
-import { config } from "../../../../config";
 import { AttestationService } from "../../../../services/attestation";
 
 const Schema = {
@@ -86,45 +83,27 @@ export default {
     req: FastifyRequestTypeBox<typeof Schema>,
     reply: FastifyReplyTypeBox<typeof Schema>,
   ) => {
-    const { genericMapping } =
-      await new AttestationService().attestNonceMappingSignature(req.body);
+    return reply.send(
+      await resolveOracleQuorum({
+        endpointPath: req.originalUrl,
+        requestBody: req.body,
+        requestApiKey: req.headers["x-api-key"],
+        requestPeerSignatures: req.body.requestPeerSignatures ?? false,
+        responseSchema: Schema.response[200],
+        createLocalResponse: async () => {
+          const { genericMapping } =
+            await new AttestationService().attestNonceMappingSignature(
+              req.body,
+            );
 
-    const peerSignatures =
-      req.body.requestPeerSignatures && config.peers
-        ? await getPeerResponses({
-            endpointPath: req.originalUrl,
-            requestBody: req.body,
-            requestApiKey: req.headers["x-api-key"],
-            validateAndExtractResponse: (peerData: any) => {
-              if (
-                areGenericMappingsEqual(peerData.genericMapping, genericMapping)
-              ) {
-                return peerData.genericMapping.signatures;
-              }
-
-              return [];
+          return {
+            genericMapping: {
+              ...genericMapping,
+              signatures: [await signGenericMappingMessage(genericMapping)],
             },
-          })
-        : [];
-
-    const localGenericMappingSignature =
-      await signGenericMappingMessage(genericMapping);
-
-    return reply.send({
-      genericMapping: {
-        ...genericMapping,
-        signatures: [
-          localGenericMappingSignature,
-          ...filterSignaturesByDomain(
-            peerSignatures,
-            localGenericMappingSignature,
-            {
-              chainId: "genericMappingChainId",
-              contract: "genericMappingContract",
-            },
-          ),
-        ],
-      },
-    });
+          };
+        },
+      }),
+    );
   },
 } as Endpoint;

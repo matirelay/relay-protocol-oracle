@@ -18,18 +18,16 @@ import {
   getVmTypeNativeCurrency,
   generateTokenId,
   generateAddress,
-  DenormalizedSubmitWithdrawRequest,
   getWithdrawalAddress,
-  normalizePayloadParams,
-  SubmitWithdrawRequest,
   GenericMappingMessage,
   getNoFillOrRefundMessage,
   getNonceMappingMessage,
-  getSubmitWithdrawRequestHash,
   encodeWithdrawal,
   getWithdrawRequestHash,
   DenormalizedWithdrawRequest,
   normalizeWithdrawRequest,
+  encodeWithdrawRequestAdditionalData,
+  WithdrawRequestAdditionalData,
   WithdrawRequest,
   DepositAddressTrigger,
   getDepositAddressTriggerHash,
@@ -37,10 +35,9 @@ import {
   encodeAddressToHex,
   ExecuteAndWithdrawFee,
   ExecuteAndWithdrawRequest,
+  VmType,
 } from "@relay-protocol/settlement-sdk";
-import axios from "axios";
 import * as bitcoin from "bitcoinjs-lib";
-import TronWeb from "tronweb";
 import {
   Address,
   decodeAbiParameters,
@@ -55,34 +52,40 @@ import {
 
 import { getVmAttestor } from "./vm";
 import { DepositMode, EnhancedDepositoryDepositMessage } from "./vm/types";
-import {
-  cartesianProduct,
-  extractEcdsaSignature,
-  getBitcoinSignerPubkey,
-  getDeterministicId,
-  normalizeBitcoinPartialSignature,
-  resolveFeeCalculator,
-  resolveRateLimiter,
-} from "./utils";
+import { FeeCommitment, resolveFastMintFee } from "./fee-commitment";
+import { getDeterministicId, resolveRateLimiter } from "./utils";
 import {
   Chain,
   getChain,
   getChainVmType,
+  getGatewayDestination,
+  getGatewaySource,
   getHubInfo,
   getSdkChainsConfig,
   RELAY_CHAIN_ID,
 } from "../../common/chains";
 import { externalError, internalError } from "../../common/error";
 import {
-  getAuroraHttpRpc,
   getBalanceOnHub,
+  getHubBatchHttpRpc,
   getHubHttpRpc,
 } from "../../common/hub";
+import { logger } from "../../common/logger";
+import { GatewayVmAttestor } from "./vm/gateway-vm";
 
 type ExecutionMetadata = Omit<
   ExecutionMessageMetadata,
   "oracleContract" | "oracleChainId"
 >;
+
+type DepositHubContext = {
+  chain: Chain;
+  gatewaySource?: Awaited<ReturnType<typeof getGatewaySource>>;
+  tokenChainId: string;
+  tokenVmType: VmType;
+  addressChainId: string;
+  addressVmType: VmType;
+};
 
 type WithdrawalAddressRequest = {
   chainId: string;
@@ -115,6 +118,17 @@ export type InputHints = Array<
   { inputIndex: number } & Pick<TxHints, "ton-vm">
 >;
 
+export type WithdrawRequestAttestationContext = {
+  chainId: number;
+  allocator: string;
+  withdrawRequestHash: string;
+};
+
+export type WithdrawRequestAttestationMessage =
+  WithdrawRequestAttestationContext & {
+    hashesToSign: string[];
+  };
+
 const getInputHints = (
   inputIndex: number,
   inputHints: InputHints | undefined,
@@ -143,25 +157,59 @@ const findEquivalentAddress = (
 };
 
 export class AttestationService {
+  private async _getDepositHubContext(data: {
+    chainId: string;
+  }): Promise<DepositHubContext> {
+    const chain = await getChain(data.chainId);
+    const gatewaySource =
+      chain.vmType === "gateway-vm" ? await getGatewaySource(chain) : undefined;
+
+    const physicalChain = gatewaySource?.chain ?? chain;
+
+    // Handle Gateway chains by separating token identity from address identity:
+    // Gateway tokens are identified by the Gateway chain, while account/order
+    // addresses are derived from the physical source chain where the deposit
+    // transaction was submitted.
+    return {
+      chain,
+      gatewaySource,
+      tokenChainId: chain.id,
+      tokenVmType: physicalChain.vmType,
+      addressChainId: physicalChain.id,
+      addressVmType: physicalChain.vmType,
+    };
+  }
+
   public async attestWithdrawAndFill(
     data: {
       chainId: string;
       transactionId: string;
+      mode?: DepositMode;
+      feeCommitment?: FeeCommitment;
       onchainId: string;
+      inputCurrency?: string;
       order: Order;
       orderSignature: string;
       nonce: string;
+      additionalData?: WithdrawRequestAdditionalData;
+      useGatewaySource?: string;
     } & { hints?: TxHints },
   ): Promise<{
     execution: ExecutionMessage;
     executeAndWithdrawRequest: ExecuteAndWithdrawRequest;
   }> {
+    if (data.order.output.calls.length !== 0) {
+      throw externalError("Fill orders with calls are not supported");
+    }
+
     const attested = await this._attestExecuteAndWithdrawDeposit(data);
 
     const executeAndWithdrawRequest =
       await this._getExecuteAndWithdrawFillRequest({
         attested,
         nonce: data.nonce,
+        additionalData: data.additionalData,
+        useGatewaySource: data.useGatewaySource,
       });
 
     return {
@@ -174,10 +222,16 @@ export class AttestationService {
     data: {
       chainId: string;
       transactionId: string;
+      mode?: DepositMode;
+      feeCommitment?: FeeCommitment;
       onchainId: string;
+      inputCurrency?: string;
+      refundIndex?: number;
       order: Order;
       orderSignature: string;
       nonce: string;
+      additionalData?: WithdrawRequestAdditionalData;
+      useGatewaySource?: string;
     } & { hints?: TxHints },
   ): Promise<{
     execution: ExecutionMessage;
@@ -188,7 +242,10 @@ export class AttestationService {
     const executeAndWithdrawRequest =
       await this._getExecuteAndWithdrawRefundRequest({
         attested,
+        refundIndex: data.refundIndex,
         nonce: data.nonce,
+        additionalData: data.additionalData,
+        useGatewaySource: data.useGatewaySource,
       });
 
     return {
@@ -198,21 +255,28 @@ export class AttestationService {
   }
 
   // Shared validation for the solver withdraw-and-{fill,refund} flows: verifies
-  // the order signature, attests the depository deposit, links it to the order
-  // and validates the order output (fill) and refund (refund) targets. Returns
-  // the Hub execution, the matched deposit and the derived output/refund data.
+  // the order signature, attests the depository deposit, links it to the order,
+  // resolves the currency to pull from the order address and validates the
+  // order output (fill) and refund (refund) targets. Returns the Hub execution,
+  // matched deposit and derived input/output/refund data.
   private async _attestExecuteAndWithdrawDeposit(
     data: {
       chainId: string;
       transactionId: string;
+      mode?: DepositMode;
+      feeCommitment?: FeeCommitment;
       onchainId: string;
+      inputCurrency?: string;
       order: Order;
       orderSignature: string;
       nonce: string;
+      useGatewaySource?: string;
     } & { hints?: TxHints },
   ): Promise<{
     execution: ExecutionMessage;
     deposit: EnhancedDepositoryDepositMessage;
+    orderAddress: string;
+    inCurrency: string;
     output: {
       chainId: string;
       currency: string;
@@ -221,14 +285,16 @@ export class AttestationService {
       deadline: number;
       fees: ExecuteAndWithdrawFee[];
     };
-    refund: {
+    // Every refund option the solver signed, left unresolved here — only the
+    // refund flow picks one, and only it accepts a caller refund currency
+    refunds: {
       chainId: string;
       currency: string;
       minimumAmount: string;
       recipient: string;
       deadline: number;
       fees: ExecuteAndWithdrawFee[];
-    };
+    }[];
   }> {
     // Get the order id
     const orderId = getOrderId(data.order, await getSdkChainsConfig());
@@ -276,25 +342,6 @@ export class AttestationService {
         "Deposit chain id does not match order input chain id",
       );
     }
-    if (deposit.result.currency !== orderInput.payment.currency) {
-      throw externalError(
-        "Deposit currency does not match order input currency",
-      );
-    }
-
-    // Only single-refund options are allowed
-    if (orderInput.refunds.length !== 1) {
-      throw externalError("Only single-refund options are allowed");
-    }
-
-    // Validate the refund details against the order input
-    const orderRefund = orderInput.refunds[0];
-    if (
-      orderRefund.chainId !== orderInput.payment.chainId ||
-      orderRefund.currency !== orderInput.payment.currency
-    ) {
-      throw externalError("Non-matching refund option");
-    }
 
     const orderOutput = data.order.output;
 
@@ -305,14 +352,62 @@ export class AttestationService {
 
     const orderOutputPayment = orderOutput.payments[0];
 
+    const inChain = await getChain(deposit.data.chainId);
+    const orderAddress = await this._getOrderAddress({
+      chainId: inChain.id,
+      vmType: inChain.vmType,
+      timestamp: deposit.extraData.timestamp,
+      depositor: deposit.result.depositor,
+      depositId: deposit.result.depositId,
+    });
+
+    // Compare currencies through the input VM's encoding so that the same
+    // token written in different notations (casing, formatting) matches
+    const encodeInCurrency = (currency: string) =>
+      encodeAddressToHex(currency, inChain.vmType);
+
+    // The currency pulled from the order address. Defaults to what was
+    // deposited, which is the only option until the order's fees are charged.
+    const inCurrency = encodeInCurrency(
+      data.inputCurrency ?? deposit.result.currency,
+    );
+
+    // `RelayExecutor` charges the order's fees out of the pulled funds, but
+    // only on the first execution. Until that happens the deposit, the order's
+    // declared input payment and every fee must all be denominated in the
+    // currency being pulled. Afterwards none of them constrain the pull.
+    const feesCharged =
+      await this._getExecuteAndWithdrawFeesCharged(orderAddress);
+    if (!feesCharged) {
+      if (encodeInCurrency(deposit.result.currency) !== inCurrency) {
+        throw externalError(
+          "Input currency must match the deposit currency until order fees are charged",
+        );
+      }
+      if (encodeInCurrency(orderInput.payment.currency) !== inCurrency) {
+        throw externalError(
+          "Deposit currency does not match order input currency",
+        );
+      }
+      for (const fee of data.order.fees) {
+        if (
+          fee.currencyChainId !== deposit.data.chainId ||
+          encodeInCurrency(fee.currency) !== inCurrency
+        ) {
+          throw externalError("Fee currency must match the input currency");
+        }
+      }
+    }
+
     // The fees are structured as follows:
     // - fees[0]: fill gas fee
     // - fees[1]: refund gas fee
     // - fees[2:]: additional fill fees
-    const allFees = await this._getExecuteAndWithdrawFees(
-      data.order,
-      deposit as EnhancedDepositoryDepositMessage,
-    );
+    // Once charged they cannot be charged again, so leave them out entirely
+    // rather than signing over amounts that no longer apply.
+    const allFees = feesCharged
+      ? []
+      : await this._getExecuteAndWithdrawFees(data.order);
     const outputFees: ExecuteAndWithdrawFee[] = [];
     const refundFees: ExecuteAndWithdrawFee[] = [];
     allFees.forEach((fee, index) => {
@@ -326,6 +421,8 @@ export class AttestationService {
     return {
       execution: depositoryDepositMessages.execution,
       deposit: deposit as EnhancedDepositoryDepositMessage,
+      orderAddress,
+      inCurrency,
       output: {
         chainId: orderOutput.chainId,
         currency: orderOutputPayment.currency,
@@ -334,14 +431,14 @@ export class AttestationService {
         deadline: orderOutput.deadline,
         fees: outputFees,
       },
-      refund: {
-        chainId: orderRefund.chainId,
-        currency: orderRefund.currency,
-        minimumAmount: orderRefund.minimumAmount,
-        recipient: orderRefund.recipient,
-        deadline: orderRefund.deadline,
+      refunds: orderInput.refunds.map((refund) => ({
+        chainId: refund.chainId,
+        currency: refund.currency,
+        minimumAmount: refund.minimumAmount,
+        recipient: refund.recipient,
+        deadline: refund.deadline,
         fees: refundFees,
-      },
+      })),
     };
   }
 
@@ -349,6 +446,7 @@ export class AttestationService {
     data: DepositoryDepositMessage["data"] & {
       hints?: TxHints;
       mode?: DepositMode;
+      feeCommitment?: FeeCommitment;
     },
   ): Promise<{
     messages: EnhancedDepositoryDepositMessage[];
@@ -357,7 +455,8 @@ export class AttestationService {
     const mode = data.mode ?? "slow";
 
     const attestor = await getVmAttestor(data.chainId);
-    const chain = await getChain(data.chainId);
+    const depositHubContext = await this._getDepositHubContext(data);
+    const { chain, gatewaySource } = depositHubContext;
 
     const messages = await attestor.getDepositoryDepositMessages(
       data.chainId,
@@ -369,26 +468,84 @@ export class AttestationService {
     // Generate Hub execution
     let execution: ExecutionMessage | undefined;
     if (messages.length) {
-      const feeRecipient =
-        chain.additionalData?.fastMode?.feeRecipient ?? zeroAddress;
+      const fastMode = (gatewaySource?.chain ?? chain).additionalData?.fastMode;
 
       const hubInfo = await getHubInfo();
 
+      // Fast messages share the requester's fee commitment and the rate-limiter
+      // budget, so both are checked once per transaction rather than per message
+      const fastMessages = messages
+        .filter((m) => m.extraData.mode === "fast")
+        .map((m) => ({
+          tokenId: generateTokenId({
+            address: m.result.currency,
+            chainId: depositHubContext.tokenChainId,
+            family: depositHubContext.tokenVmType,
+          }),
+          amount: BigInt(m.result.amount),
+          feeBps: m.extraData.fastFeeBps ?? "0",
+        }));
+      let fastContext:
+        | {
+            rateLimiter: string;
+            rateLimiterData: string;
+            feeCalculator: string;
+            feeCalculatorData: string;
+          }
+        | undefined;
+      if (fastMessages.length) {
+        const rateLimiter = hubInfo.rateLimiter;
+        if (!rateLimiter) {
+          throw internalError("Missing fast mode rate-limiter configuration");
+        }
+
+        const { withinBudget, rateLimiterData } = await resolveRateLimiter({
+          type: rateLimiter.type,
+          address: rateLimiter.address,
+          // The chain whose fastMode configuration authorized the fast path
+          chainId: (gatewaySource?.chain ?? chain).id,
+          entries: fastMessages,
+        });
+        if (!withinBudget) {
+          throw externalError("Fast mode rate limit exceeded");
+        }
+
+        fastContext = {
+          rateLimiter: rateLimiter.address,
+          rateLimiterData,
+          ...(await resolveFastMintFee({
+            fastMessages,
+            fastMode,
+            feeCalculator: hubInfo.feeCalculator,
+            chainId: data.chainId,
+            transactionId: data.transactionId,
+            commitment: data.feeCommitment,
+          })),
+        };
+      }
+
       const messageEntries = await Promise.all(
         messages.map(async (m) => {
-          const origin = {
+          const hubTokenId = generateTokenId({
             address: m.result.currency,
-            chainId: m.data.chainId,
-            family: await getChainVmType(m.data.chainId),
-          };
+            chainId: depositHubContext.tokenChainId,
+            family: depositHubContext.tokenVmType,
+          });
 
-          const hubTokenId = generateTokenId(origin);
-          const metadataEntry: ExecutionMetadata = { hubTokenId, origin };
+          const metadataEntry: ExecutionMetadata = {
+            hubTokenId,
+            origin: {
+              address: m.result.currency,
+              chainId: depositHubContext.tokenChainId,
+              family: depositHubContext.tokenVmType,
+            },
+          };
 
           const hubToAddress =
             m.result.depositId !== zeroHash
               ? await this._getOrderAddress({
-                  chainId: m.data.chainId,
+                  chainId: depositHubContext.addressChainId,
+                  vmType: depositHubContext.addressVmType,
                   timestamp: m.extraData.timestamp,
                   depositor: m.result.depositor,
                   depositId: m.result.depositId,
@@ -396,62 +553,19 @@ export class AttestationService {
               : // In case no deposit id is attached, use the depositor alias on the hub
                 generateAddress({
                   address: m.result.depositor,
-                  chainId: m.data.chainId,
-                  family: origin.family,
+                  chainId: depositHubContext.addressChainId,
+                  family: depositHubContext.addressVmType,
                 });
 
           const amount = m.result.amount;
 
           let action: string;
           if (m.extraData.mode === "fast") {
-            const feeBps = m.extraData.fastFeeBps ?? "0";
-
-            // Safety checks
-            if (BigInt(feeBps) > 0n && feeRecipient === zeroAddress) {
-              throw internalError(
-                "Missing fast mode feeRecipient configuration",
-              );
+            if (!fastContext) {
+              throw internalError("Missing fast attestation context");
             }
-            if (!hubInfo.rateLimiter) {
-              throw internalError(
-                "Missing fast mode rate-limiter configuration",
-              );
-            }
-
-            // Handle rate-limiting
-            let rateLimiter: string | undefined;
-            let rateLimiterData: string | undefined;
-            if (hubInfo.rateLimiter) {
-              const result = await resolveRateLimiter({
-                type: hubInfo.rateLimiter.type,
-                address: hubInfo.rateLimiter.address,
-                chainId: m.data.chainId,
-                currency: m.result.currency,
-                amount,
-              });
-              if (!result.withinBudget) {
-                throw externalError("Fast mode rate limit exceeded");
-              }
-
-              rateLimiter = hubInfo.rateLimiter.address;
-              rateLimiterData = result.rateLimiterData;
-            }
-
-            // Handle fees
-            let feeCalculator: string | undefined;
-            let feeCalculatorData: string | undefined;
-            if (hubInfo.feeCalculator) {
-              const result = await resolveFeeCalculator({
-                type: hubInfo.feeCalculator.type,
-                address: hubInfo.feeCalculator.address,
-                chainId: m.data.chainId,
-                currency: m.result.currency,
-                amount,
-              });
-
-              feeCalculator = hubInfo.feeCalculator.address;
-              feeCalculatorData = result.feeCalculatorData;
-            }
+            // Fee-free fast deposits skip fee calculation entirely (zero address)
+            const hasFee = BigInt(m.extraData.fastFeeBps ?? "0") > 0n;
 
             action = encodeAction({
               type: ActionType.FAST_MINT,
@@ -459,10 +573,12 @@ export class AttestationService {
                 hubTokenId,
                 hubToAddress,
                 amount,
-                feeCalculator: feeCalculator ?? zeroAddress,
-                feeCalculatorData: feeCalculatorData ?? "0x",
-                rateLimiter: rateLimiter ?? zeroAddress,
-                rateLimiterData: rateLimiterData ?? "0x",
+                feeCalculator: hasFee ? fastContext.feeCalculator : zeroAddress,
+                feeCalculatorData: hasFee
+                  ? fastContext.feeCalculatorData
+                  : "0x",
+                rateLimiter: fastContext.rateLimiter,
+                rateLimiterData: fastContext.rateLimiterData,
               },
             });
           } else {
@@ -501,69 +617,6 @@ export class AttestationService {
     };
   }
 
-  public async attestWithdrawalInitiation(
-    data: DenormalizedSubmitWithdrawRequest,
-  ): Promise<{
-    withdrawalAddress: string;
-    execution: ExecutionMessage;
-  }> {
-    // Ensure the amount is non-zero
-    if (BigInt(data.amount) <= 0) {
-      throw externalError("Withdrawn amount must be non-zero");
-    }
-
-    // The token to be withdrawn from depository
-    const hubTokenId = generateTokenId({
-      address: data.currency,
-      chainId: data.chainId,
-      family: await getChainVmType(data.chainId),
-    });
-
-    // Safety check to ensure the owner has sufficient balance
-    const balance = await getBalanceOnHub(data.spender, hubTokenId);
-    if (!balance || BigInt(balance) < BigInt(data.amount)) {
-      throw externalError("Insufficient balance for requested withdrawal");
-    }
-
-    // Compute withdrawal address
-    const chain = await getChain(data.chainId);
-    const depository = this._getConfiguredDepository(chain, data.depository);
-    const withdrawalAddress = getWithdrawalAddress({
-      vmType: chain.vmType,
-      chainId: data.chainId,
-      depository,
-      currency: data.currency,
-      recipient: data.recipient,
-      ownerAlias: data.spender,
-      nonce: data.nonce,
-    });
-
-    const hubInfo = await getHubInfo();
-    const execution = {
-      idempotencyKey: getDeterministicId(
-        hubInfo.id,
-        hubTokenId.toString(),
-        withdrawalAddress,
-      ),
-      actions: [
-        encodeAction({
-          type: ActionType.TRANSFER,
-          data: {
-            hubTokenId: hubTokenId,
-            hubFromAddress: data.spender,
-            hubToAddress: withdrawalAddress,
-            amount: data.amount,
-          },
-        }),
-      ],
-    };
-
-    return {
-      withdrawalAddress,
-      execution,
-    };
-  }
-
   public async attestTransfer(data: {
     chainId: string;
     currency: string;
@@ -579,11 +632,15 @@ export class AttestationService {
       throw externalError("Transfer amount must be non-zero");
     }
 
+    const hubContext = await this._getDepositHubContext({
+      chainId: data.chainId,
+    });
+
     // The hub token being transferred
     const hubTokenId = generateTokenId({
       address: data.currency,
-      chainId: data.chainId,
-      family: await getChainVmType(data.chainId),
+      chainId: hubContext.tokenChainId,
+      family: hubContext.tokenVmType,
     });
 
     // Safety check to ensure the alias has sufficient balance
@@ -616,51 +673,6 @@ export class AttestationService {
 
     return {
       execution,
-    };
-  }
-
-  public async attestWithdrawalInitiated(
-    data: DenormalizedSubmitWithdrawRequest,
-  ): Promise<{
-    payloadParams: SubmitWithdrawRequest;
-  }> {
-    // Ensure the amount is non-zero
-    if (BigInt(data.amount) <= 0) {
-      throw externalError("Withdrawn amount must be non-zero");
-    }
-
-    // The token to be withdrawn from depository
-    const hubTokenId = generateTokenId({
-      address: data.currency,
-      chainId: data.chainId,
-      family: await getChainVmType(data.chainId),
-    });
-
-    // Compute withdrawal address
-    const chain = await getChain(data.chainId);
-    const depository = this._getConfiguredDepository(chain, data.depository);
-    const withdrawalAddress = getWithdrawalAddress({
-      vmType: chain.vmType,
-      chainId: data.chainId,
-      depository,
-      currency: data.currency,
-      recipient: data.recipient,
-      ownerAlias: data.spender,
-      nonce: data.nonce,
-    });
-
-    // Safety check to ensure the withdrawn amount matches the withdrawal address balance
-    const balance = await getBalanceOnHub(withdrawalAddress, hubTokenId);
-    if (BigInt(balance) !== BigInt(data.amount)) {
-      throw externalError(
-        "Withdrawn amount different from withdrawal address balance",
-      );
-    }
-
-    const payloadParams = await this._getPayloadParams(data);
-
-    return {
-      payloadParams,
     };
   }
 
@@ -740,72 +752,6 @@ export class AttestationService {
     };
   }
 
-  public async attestDepositoryWithdrawalV2(
-    data: DenormalizedSubmitWithdrawRequest & {
-      transactionId?: string;
-      hints?: TxHints;
-      withdrawalAddressRequest: WithdrawalAddressRequest;
-    },
-  ): Promise<{
-    status: DepositoryWithdrawalStatus;
-    execution?: ExecutionMessage;
-  }> {
-    const payloadParams = await this._getPayloadParams(data);
-
-    // A single withdrawal can have more than one valid encoding - an allocator
-    // input may have been signed more than once (eg retried NEAR MPC signing),
-    // and the transaction that actually landed on-chain might use any of those
-    // signatures. Each combination yields a distinct (but equivalent) signed
-    // payload, so we check them all and treat the withdrawal as executed if any
-    // of them matches the on-chain spend.
-    const withdrawals = await this._getEncodedWithdrawalV2(
-      data.chainId,
-      payloadParams,
-    );
-    if (!withdrawals.length) {
-      return { status: DepositoryWithdrawalStatus.PENDING };
-    }
-
-    const results = await Promise.all(
-      withdrawals.map((withdrawal) =>
-        this.attestDepositoryWithdrawal({
-          chainId: data.chainId,
-          withdrawal,
-          transactionId: data.transactionId,
-          hints: data.hints,
-          withdrawalAddressRequest: data.withdrawalAddressRequest,
-        }),
-      ),
-    );
-
-    // If any of the withdrawal encodings is executed, then we mark the withdrawal as executed
-    const executedResult = results.find(
-      (r) => r.message.result.status === DepositoryWithdrawalStatus.EXECUTED,
-    );
-    if (executedResult) {
-      return {
-        status: executedResult.message.result.status,
-        execution: executedResult.execution,
-      };
-    }
-
-    // If all of the withdrawal encodings are expired, then we mark the withdrawal as expired
-    if (
-      results.every(
-        (result) =>
-          result.message.result.status === DepositoryWithdrawalStatus.EXPIRED,
-      )
-    ) {
-      return {
-        status: results[0].message.result.status,
-        execution: results[0].execution,
-      };
-    }
-
-    // Otheriwse, the withdrawal is still pending
-    return { status: DepositoryWithdrawalStatus.PENDING };
-  }
-
   public async attestDepositoryWithdrawalV3(
     data: DenormalizedWithdrawRequest & {
       transactionId?: string;
@@ -816,9 +762,14 @@ export class AttestationService {
     execution?: ExecutionMessage;
   }> {
     const chain = await getChain(data.chainId);
+    const depository = await this._getConfiguredDepository(
+      chain,
+      data.depository,
+    );
+
     const withdrawRequest = normalizeWithdrawRequest({
       ...data,
-      depository: this._getConfiguredDepository(chain, data.depository),
+      depository,
       vmType: await getChainVmType(data.chainId),
       spenderVmType: await getChainVmType(data.spenderChainId),
     });
@@ -836,11 +787,14 @@ export class AttestationService {
     let execution: ExecutionMessage | undefined;
     if (message.result.status === DepositoryWithdrawalStatus.EXPIRED) {
       const withdrawRequestHash = getWithdrawRequestHash(withdrawRequest);
+      const hubContext = await this._getDepositHubContext({
+        chainId: withdrawRequest.chainId,
+      });
 
       const hubTokenId = generateTokenId({
         address: data.currency,
-        chainId: withdrawRequest.chainId,
-        family: await getChainVmType(withdrawRequest.chainId),
+        chainId: hubContext.tokenChainId,
+        family: hubContext.tokenVmType,
       });
 
       const spenderAlias = generateAddress({
@@ -1239,7 +1193,9 @@ export class AttestationService {
 
     const isValidSignature = await verifyTypedData({
       address: data.wallet as Address,
-      domain: NONCE_MAPPING_DOMAIN(Number(signatureChain.hubChainId!)),
+      domain: NONCE_MAPPING_DOMAIN(
+        Number(signatureChain.additionalData?.evmChainId),
+      ),
       types: NONCE_MAPPING_TYPES,
       primaryType: "NonceMapping",
       message,
@@ -1302,7 +1258,9 @@ export class AttestationService {
 
     const isValidSignature = await verifyTypedData({
       address: data.solver as Address,
-      domain: NO_FILL_OR_REFUND_DOMAIN(Number(solverChain.hubChainId!)),
+      domain: NO_FILL_OR_REFUND_DOMAIN(
+        Number(solverChain.additionalData?.evmChainId),
+      ),
       types: NO_FILL_OR_REFUND_TYPES,
       primaryType: "NoFillOrRefund",
       message,
@@ -1325,12 +1283,78 @@ export class AttestationService {
 
   public async attestWithdrawRequest(
     data: DenormalizedWithdrawRequest & { hashIndexes: number[] },
-  ): Promise<{
-    chainId: number;
-    allocator: string;
-    withdrawRequestHash: string;
-    hashesToSign: string[];
-  }> {
+  ): Promise<WithdrawRequestAttestationMessage> {
+    const context = await this.getWithdrawRequestAttestationContext(data);
+    const hashesToSign = await this.getWithdrawRequestHashesToSign(
+      context,
+      data.hashIndexes,
+    );
+
+    return {
+      ...context,
+      hashesToSign,
+    };
+  }
+
+  public async getWithdrawRequestHashesToSign(
+    context: WithdrawRequestAttestationContext,
+    hashIndexes: number[],
+  ): Promise<string[]> {
+    const uniqueIndexes = [...new Set(hashIndexes)];
+    const readHashes = async (
+      client: Awaited<ReturnType<typeof getHubHttpRpc>>,
+    ) => {
+      const allocator = getContract({
+        address: context.allocator as Address,
+        abi: parseAbi([
+          "function hashesToSign(bytes32 withdrawRequestHash, uint256 index) view returns (bytes32)",
+        ]),
+        client,
+      });
+      return Promise.all(
+        uniqueIndexes.map((hashIndex) =>
+          allocator.read.hashesToSign([
+            context.withdrawRequestHash as Hex,
+            BigInt(hashIndex),
+          ]),
+        ),
+      );
+    };
+
+    let uniqueHashes: string[];
+    if (uniqueIndexes.length === 1) {
+      uniqueHashes = await readHashes(await getHubHttpRpc());
+    } else {
+      try {
+        uniqueHashes = await readHashes(await getHubBatchHttpRpc());
+      } catch {
+        logger.warn(
+          "attestation-service",
+          JSON.stringify({
+            msg: "Batched withdrawal hash lookup failed, using concurrent requests",
+            hashCount: uniqueIndexes.length,
+          }),
+        );
+        uniqueHashes = await readHashes(await getHubHttpRpc());
+      }
+    }
+
+    const hashesByIndex = new Map<number, string>();
+    uniqueIndexes.forEach((hashIndex, position) => {
+      const hashToSign = uniqueHashes[position];
+      if (hashToSign === zeroHash) {
+        throw externalError(
+          `Hash to sign not set for withdraw request at index ${hashIndex}`,
+        );
+      }
+      hashesByIndex.set(hashIndex, hashToSign);
+    });
+    return hashIndexes.map((hashIndex) => hashesByIndex.get(hashIndex)!);
+  }
+
+  public async getWithdrawRequestAttestationContext(
+    data: DenormalizedWithdrawRequest,
+  ): Promise<WithdrawRequestAttestationContext> {
     const hubInfo = await getHubInfo();
     const withdrawRequest = normalizeWithdrawRequest({
       ...data,
@@ -1339,33 +1363,10 @@ export class AttestationService {
     });
     const withdrawRequestHash = getWithdrawRequestHash(withdrawRequest);
 
-    const allocator = getContract({
-      address: hubInfo.allocatorAddress as Address,
-      abi: parseAbi([
-        "function hashesToSign(bytes32 withdrawRequestHash, uint256 index) view returns (bytes32)",
-      ]),
-      client: await getHubHttpRpc(),
-    });
-    const hashesToSign = await Promise.all(
-      data.hashIndexes.map(async (hashIndex) => {
-        const hashToSign = await allocator.read.hashesToSign([
-          withdrawRequestHash as Hex,
-          BigInt(hashIndex),
-        ]);
-        if (hashToSign === zeroHash) {
-          throw externalError(
-            `Hash to sign not set for withdraw request at index ${hashIndex}`,
-          );
-        }
-        return hashToSign;
-      }),
-    );
-
     return {
       chainId: Number(hubInfo.evmChainId),
       allocator: hubInfo.allocatorAddress,
       withdrawRequestHash,
-      hashesToSign,
     };
   }
 
@@ -1453,9 +1454,12 @@ export class AttestationService {
       throw externalError("Deposit does not have a depositId");
     }
 
+    const vmType = await getChainVmType(data.chainId);
+
     // Compute the order address on the hub
     const orderAddress = await this._getOrderAddress({
       chainId: data.chainId,
+      vmType,
       timestamp: deposit.extraData.timestamp,
       depositor: deposit.result.depositor,
       depositId: deposit.result.depositId,
@@ -1465,7 +1469,7 @@ export class AttestationService {
     const hubTokenId = generateTokenId({
       address: deposit.result.currency,
       chainId: data.chainId,
-      family: await getChainVmType(data.chainId),
+      family: vmType,
     });
 
     // Balance check
@@ -1526,29 +1530,34 @@ export class AttestationService {
       ReturnType<AttestationService["_attestExecuteAndWithdrawDeposit"]>
     >;
     nonce: string;
+    additionalData?: WithdrawRequestAdditionalData;
+    useGatewaySource?: string;
   }): Promise<ExecuteAndWithdrawRequest> {
-    const { deposit, output } = data.attested;
-
-    const orderAddress = await this._getOrderAddress({
-      chainId: deposit.data.chainId,
-      timestamp: deposit.extraData.timestamp,
-      depositor: deposit.result.depositor,
-      depositId: deposit.result.depositId,
-    });
+    const { deposit, orderAddress, inCurrency, output } = data.attested;
 
     const inChain = await getChain(deposit.data.chainId);
-    const outChain = await getChain(output.chainId);
+
+    const destination = await this._getExecuteAndWithdrawDestination({
+      chainId: output.chainId,
+      currency: output.currency,
+      amount: output.minimumAmount,
+      recipient: output.recipient,
+      orderAddress,
+      nonce: data.nonce,
+      additionalData: data.additionalData,
+      useGatewaySource: data.useGatewaySource,
+    });
 
     return {
       inChainId: inChain.id,
-      inCurrency: encodeAddressToHex(deposit.result.currency, inChain.vmType),
-      outChainId: outChain.id,
-      outCurrency: encodeAddressToHex(output.currency, outChain.vmType),
+      inCurrency,
+      outChainId: destination.outChainId,
+      outCurrency: destination.outCurrency,
       outAmountMinimum: output.minimumAmount,
-      depository: encodeAddressToHex(outChain.depository!, outChain.vmType),
+      depository: destination.depository,
       orderAddress,
-      receiver: encodeAddressToHex(output.recipient, outChain.vmType),
-      data: "0x",
+      receiver: destination.receiver,
+      data: destination.data,
       fees: output.fees,
       nonce: data.nonce,
       // The oracle authorization expires alongside the solver-signed order's
@@ -1558,38 +1567,51 @@ export class AttestationService {
     };
   }
 
-  // Builds an `ExecuteAndWithdrawRequest` that refunds the input currency back
-  // to the order's refund recipient (rather than filling the order output).
-  // The order must declare exactly one refund matching the input payment
-  // currency/chain.
+  // Builds an `ExecuteAndWithdrawRequest` that pays out one of the order's
+  // signed refund options (rather than filling the order output).
   private async _getExecuteAndWithdrawRefundRequest(data: {
     attested: Awaited<
       ReturnType<AttestationService["_attestExecuteAndWithdrawDeposit"]>
     >;
+    refundIndex?: number;
     nonce: string;
+    additionalData?: WithdrawRequestAdditionalData;
+    useGatewaySource?: string;
   }): Promise<ExecuteAndWithdrawRequest> {
-    const { deposit, refund } = data.attested;
-
-    const orderAddress = await this._getOrderAddress({
-      chainId: deposit.data.chainId,
-      timestamp: deposit.extraData.timestamp,
-      depositor: deposit.result.depositor,
-      depositId: deposit.result.depositId,
-    });
+    const { deposit, orderAddress, inCurrency, refunds } = data.attested;
 
     const inChain = await getChain(deposit.data.chainId);
-    const outChain = await getChain(refund.chainId);
+
+    // The refund pays out one of the options the solver signed refund terms
+    // for, picked by index so the chain and currency are taken verbatim from
+    // the order. Independent of what gets pulled from the order address, and
+    // not necessarily on the deposit chain.
+    const refund = refunds[data.refundIndex ?? 0];
+    if (!refund) {
+      throw externalError("Order input has no refund option at that index");
+    }
+
+    const destination = await this._getExecuteAndWithdrawDestination({
+      chainId: refund.chainId,
+      currency: refund.currency,
+      amount: refund.minimumAmount,
+      recipient: refund.recipient,
+      orderAddress,
+      nonce: data.nonce,
+      additionalData: data.additionalData,
+      useGatewaySource: data.useGatewaySource,
+    });
 
     return {
       inChainId: inChain.id,
-      inCurrency: encodeAddressToHex(deposit.result.currency, inChain.vmType),
-      outChainId: outChain.id,
-      outCurrency: encodeAddressToHex(refund.currency, outChain.vmType),
+      inCurrency,
+      outChainId: destination.outChainId,
+      outCurrency: destination.outCurrency,
       outAmountMinimum: refund.minimumAmount,
-      depository: encodeAddressToHex(outChain.depository!, outChain.vmType),
+      depository: destination.depository,
       orderAddress,
-      receiver: encodeAddressToHex(refund.recipient, outChain.vmType),
-      data: "0x",
+      receiver: destination.receiver,
+      data: destination.data,
       fees: refund.fees,
       nonce: data.nonce,
       // The oracle authorization expires alongside the solver-signed order's
@@ -1599,23 +1621,127 @@ export class AttestationService {
     };
   }
 
-  // `RelayExecutor` charges fees in the input currency, deducted from the
-  // pulled order funds before executing any calls. Every order fee must
-  // therefore be denominated in the deposit's (input) currency, and the
-  // recipient is resolved to its Hub account alias.
+  private async _getExecuteAndWithdrawFeesCharged(
+    orderAddress: string,
+  ): Promise<boolean> {
+    const hubInfo = await getHubInfo();
+    const executor = getContract({
+      address: hubInfo.executorAddress as Address,
+      abi: parseAbi([
+        "function feesChargedByOrderAddress(address orderAddress) view returns (bool)",
+      ]),
+      client: await getHubHttpRpc(),
+    });
+    return executor.read.feesChargedByOrderAddress([orderAddress as Address]);
+  }
+
+  private async _getExecuteAndWithdrawDestination(data: {
+    chainId: string;
+    currency: string;
+    amount: string;
+    recipient: string;
+    orderAddress: string;
+    nonce: string;
+    additionalData?: WithdrawRequestAdditionalData;
+    useGatewaySource?: string;
+  }): Promise<
+    Pick<
+      ExecuteAndWithdrawRequest,
+      "outChainId" | "outCurrency" | "depository" | "receiver" | "data"
+    >
+  > {
+    const destinationChain = await getChain(data.chainId);
+
+    // The standard path withdraws the order's requested currency through the
+    // physical destination chain's regular depository
+    if (!data.useGatewaySource) {
+      const depository = destinationChain.depository!;
+      const receiver = encodeAddressToHex(
+        data.recipient,
+        destinationChain.vmType,
+      );
+      const outCurrency = encodeAddressToHex(
+        data.currency,
+        destinationChain.vmType,
+      );
+
+      return {
+        outChainId: destinationChain.id,
+        outCurrency,
+        depository: encodeAddressToHex(depository, destinationChain.vmType),
+        receiver,
+        data: encodeWithdrawRequestAdditionalData({
+          vmType: destinationChain.vmType,
+          additionalData: data.additionalData,
+          depository,
+        }),
+      };
+    }
+
+    const gatewayChain = await getChain(data.useGatewaySource);
+
+    // Gateway can only back native Circle USDC on a configured physical
+    // destination. Compare encoded addresses so validation follows that VM's
+    // address normalization rules.
+    const gatewayDestination = await getGatewayDestination(
+      gatewayChain,
+      destinationChain.id,
+    );
+    if (
+      encodeAddressToHex(data.currency, destinationChain.vmType) !==
+      encodeAddressToHex(gatewayDestination.usdc, destinationChain.vmType)
+    ) {
+      throw externalError(
+        `Gateway withdrawals require configured Circle USDC on ${destinationChain.id}`,
+      );
+    }
+
+    // The additional data is caller-provided but gets encoded into the
+    // oracle-signed withdraw request, and `GatewayVmPayloadBuilder` routes the
+    // withdrawal by it. Validate it against the attested order before signing.
+    const gatewayAdditionalData = data.additionalData?.["gateway-vm"];
+    if (!gatewayAdditionalData) {
+      throw externalError("Additional data is required for gateway-vm");
+    }
+    if (gatewayAdditionalData.destinationChainId !== destinationChain.id) {
+      throw externalError(
+        `Gateway destination chain ${gatewayAdditionalData.destinationChainId} does not match the order destination chain ${destinationChain.id}`,
+      );
+    }
+    await new GatewayVmAttestor().validateMaxBlockHeight(
+      gatewayChain,
+      gatewayAdditionalData.maxBlockHeight,
+    );
+
+    const depository = await this._getConfiguredDepository(gatewayChain);
+    const receiver = encodeAddressToHex(
+      data.recipient,
+      destinationChain.vmType,
+    );
+
+    // The Hub burns the configured source Gateway token, while the depository
+    // identifies its source bucket. The receiver remains encoded for the
+    // physical destination VM, whose routing metadata is carried in `data`.
+    return {
+      outChainId: gatewayChain.id,
+      outCurrency: zeroAddress,
+      depository,
+      receiver,
+      data: encodeWithdrawRequestAdditionalData({
+        vmType: gatewayChain.vmType,
+        additionalData: data.additionalData,
+      }),
+    };
+  }
+
+  // Resolves each order fee recipient to its Hub account alias. Fee currencies
+  // are validated in `_attestExecuteAndWithdrawDeposit`, which owns the
+  // charged/uncharged distinction.
   private async _getExecuteAndWithdrawFees(
     order: Order,
-    deposit: EnhancedDepositoryDepositMessage,
   ): Promise<ExecuteAndWithdrawFee[]> {
     const fees: ExecuteAndWithdrawFee[] = [];
     for (const fee of order.fees) {
-      if (
-        fee.currencyChainId !== deposit.data.chainId ||
-        fee.currency !== deposit.result.currency
-      ) {
-        throw externalError("Fee currency must match the input currency");
-      }
-
       fees.push({
         recipient: generateAddress({
           address: fee.recipient,
@@ -1709,6 +1835,45 @@ export class AttestationService {
           );
         }
 
+        // The sibling execute-and-withdraw path rejects a deposit whose currency differs from the
+        // order input (until the order's fees have been charged). Measure how often that would
+        // fire here before enforcing the same rule.
+        if (depositoryDeposit.result.currency !== orderInput.payment.currency) {
+          const vmType = await getChainVmType(orderInput.payment.chainId);
+          const encode = (value: string) => {
+            try {
+              return encodeAddressToHex(value, vmType);
+            } catch {
+              return undefined;
+            }
+          };
+          const encodedOrderCurrency = encode(orderInput.payment.currency);
+          const encodedDepositCurrency = encode(
+            depositoryDeposit.result.currency,
+          );
+
+          logger.warn(
+            "solver-fill-deposit-currency",
+            JSON.stringify({
+              msg: "Deposit currency does not match order input currency",
+              orderId,
+              inputPaymentIndex,
+              chainId: orderInput.payment.chainId,
+              vmType,
+              orderCurrency: orderInput.payment.currency,
+              depositCurrency: depositoryDeposit.result.currency,
+              // true = same token, different encoding; false = different token;
+              // null = not address-encodable for this vm (lighter asset indexes, hyperliquid dex ids)
+              encodedMatch:
+                encodedOrderCurrency && encodedDepositCurrency
+                  ? encodedOrderCurrency === encodedDepositCurrency
+                  : null,
+              transactionId: inputInformation.transactionId,
+              onchainId: inputInformation.onchainId,
+            }),
+          );
+        }
+
         // Keep track of the total weighted paid amount
         totalWeightedPaidAmount +=
           BigInt(depositoryDeposit.result.amount) *
@@ -1751,14 +1916,16 @@ export class AttestationService {
 
     // Transfer from order to solver
     for (const deposit of data.depositoryDeposits) {
+      const vmType = await getChainVmType(deposit.data.chainId);
       const hubTokenId = generateTokenId({
         address: deposit.result.currency,
         chainId: deposit.data.chainId,
-        family: await getChainVmType(deposit.data.chainId),
+        family: vmType,
       });
 
       const hubFromAddress = await this._getOrderAddress({
         chainId: deposit.data.chainId,
+        vmType,
         timestamp: deposit.extraData.timestamp,
         depositor: deposit.result.depositor,
         depositId: deposit.result.depositId,
@@ -1832,12 +1999,13 @@ export class AttestationService {
 
   private async _getOrderAddress(data: {
     chainId: string;
+    vmType: VmType;
     timestamp: string;
     depositor: string;
     depositId: string;
   }): Promise<string> {
     return getOrderAddress({
-      vmType: await getChainVmType(data.chainId),
+      vmType: data.vmType,
       chainId: data.chainId,
       depositor: data.depositor,
       timestamp: BigInt(data.timestamp),
@@ -1845,7 +2013,25 @@ export class AttestationService {
     });
   }
 
-  private _getConfiguredDepository(chain: Chain, requestedDepository?: string) {
+  private async _getConfiguredDepository(
+    chain: Chain,
+    requestedDepository?: string,
+  ) {
+    if (chain.vmType === "gateway-vm") {
+      const source = await getGatewaySource(chain);
+      const configured = encodeAddressToHex(
+        source.gatewayDepository,
+        source.chain.vmType,
+      );
+      const requested = requestedDepository ?? configured;
+      if (requested.toLowerCase() !== configured.toLowerCase()) {
+        throw externalError(
+          `Depository ${requested} is not configured for chain ${chain.id}`,
+        );
+      }
+      return configured;
+    }
+
     const requested = requestedDepository ?? chain.depository;
     if (!requested) {
       throw externalError("Chain has no depository configured");
@@ -1885,7 +2071,10 @@ export class AttestationService {
     });
 
     // Compute address
-    const depository = this._getConfiguredDepository(chain, data.depository);
+    const depository = await this._getConfiguredDepository(
+      chain,
+      data.depository,
+    );
     const withdrawalAddress = getWithdrawalAddress({
       depository,
       chainId: data.chainId,
@@ -1901,211 +2090,6 @@ export class AttestationService {
       withdrawalAddress,
       withdrawerAlias,
     };
-  }
-
-  private async _getPayloadParams(data: DenormalizedSubmitWithdrawRequest) {
-    const chain = await getChain(data.chainId);
-
-    const attestor = await getVmAttestor(data.chainId);
-    const result = await attestor.validateSubmitWithdrawRequest(data);
-    if (!result) {
-      throw new Error("Invalid withdraw request");
-    }
-
-    const payloadParams = normalizePayloadParams({
-      ...data,
-      depository: this._getConfiguredDepository(chain, data.depository),
-      chainId: chain.hubChainId!,
-      vmType: chain.vmType,
-    });
-
-    return payloadParams;
-  }
-
-  private async _getEncodedWithdrawalV2(
-    chainId: string,
-    payloadParams: SubmitWithdrawRequest,
-  ): Promise<string[]> {
-    const hubInfo = await getHubInfo();
-
-    const allocator = getContract({
-      address: hubInfo.auroraAllocatorAddress as Address,
-      abi: parseAbi([
-        "function payloads(bytes32 payloadId) view returns (bytes unsignedPayload)",
-        "function payloadTimestamps(bytes32 payloadId) view returns (uint256 timestamp)",
-        "function payloadBuilders(uint256 chainId, string depository) view returns (address)",
-        "function signedPayloads(bytes32 payloadId, bytes32 hashToSign) view returns (bytes)",
-      ]),
-      client: await getAuroraHttpRpc(),
-    });
-
-    const payloadBuilderAddress = await allocator.read.payloadBuilders([
-      BigInt(payloadParams.chainId),
-      payloadParams.depository,
-    ]);
-    if (payloadBuilderAddress === zeroAddress) {
-      throw externalError(
-        `No payload builder configured for chain ${payloadParams.chainId}`,
-      );
-    }
-
-    const payloadBuilder = getContract({
-      address: payloadBuilderAddress,
-      abi: parseAbi([
-        "function family() view returns (string)",
-        "function hashToSign(uint256 chainId, string depository, bytes payload, uint32 index) view returns (bytes32)",
-      ]),
-      client: await getAuroraHttpRpc(),
-    });
-    const family = await payloadBuilder.read.family();
-
-    const depository =
-      family === "tron-vm"
-        ? TronWeb.utils.address
-            .toHex(payloadParams.depository)
-            .replace(TronWeb.utils.address.ADDRESS_PREFIX_REGEX, "0x")
-        : payloadParams.depository;
-
-    const payloadId = getSubmitWithdrawRequestHash(payloadParams);
-    const payload = await allocator.read.payloads([payloadId as Hex]);
-    if (payload === "0x") {
-      return [];
-    }
-
-    switch (family) {
-      case "ethereum-vm":
-      case "hyperliquid-vm":
-      case "lighter-vm":
-      case "tron-vm": {
-        const hashToSign = await payloadBuilder.read.hashToSign([
-          BigInt(payloadParams.chainId),
-          depository,
-          payload,
-          0,
-        ]);
-
-        const signature = await allocator.read.signedPayloads([
-          payloadId as Hex,
-          hashToSign,
-        ]);
-        return signature === "0x" ? [] : [payload];
-      }
-
-      case "solana-vm": {
-        const hashToSign = await payloadBuilder.read.hashToSign([
-          BigInt(payloadParams.chainId),
-          depository,
-          payload,
-          0,
-        ]);
-
-        const signature = await allocator.read.signedPayloads([
-          payloadId as Hex,
-          hashToSign,
-        ]);
-        return signature === "0x" ? [] : [payload];
-      }
-
-      case "bitcoin-vm": {
-        const transactionData = this._decodeBitcoinTransactionData(
-          payload as Hex,
-        );
-
-        // For every input, gather all signatures the allocator produced for it.
-        // An input can legitimately be signed more than once (eg a retried NEAR
-        // MPC signing), each producing a different but valid signature, and the
-        // the transaction that landed on-chain may use any of them.
-        const perInputSignatures = await Promise.all(
-          transactionData.inputs.map(async (_, i) => {
-            const hashToSign = await payloadBuilder.read.hashToSign([
-              BigInt(payloadParams.chainId),
-              depository,
-              payload,
-              i,
-            ]);
-            const storedSignature = await allocator.read.signedPayloads([
-              payloadId as Hex,
-              hashToSign,
-            ]);
-
-            const signatures = new Set<string>();
-            if (storedSignature && storedSignature !== "0x") {
-              signatures.add(extractEcdsaSignature(storedSignature));
-            }
-
-            const PAYLOAD_WITHDRAW_SIGNED_TOPIC =
-              "0x0442d576de21d369ae594c20a06e751211e214c91de4b237e5f66edd1900f1f9";
-            const response = await axios.post(
-              hubInfo.auroraHttpRpcUrl,
-              {
-                jsonrpc: "2.0",
-                id: 1,
-                method: "eth_getLogs",
-                params: [
-                  {
-                    fromBlock: "earliest",
-                    toBlock: "latest",
-                    address: hubInfo.auroraAllocatorAddress,
-                    topics: [
-                      PAYLOAD_WITHDRAW_SIGNED_TOPIC,
-                      payloadId,
-                      hashToSign,
-                    ],
-                  },
-                ],
-              },
-              { timeout: 10000 },
-            );
-            if (response.data?.error) {
-              throw internalError(
-                `Allocator signature lookup failed: ${JSON.stringify(
-                  response.data.error,
-                )}`,
-              );
-            }
-
-            for (const log of response.data?.result ?? []) {
-              const [signedPayload] = decodeAbiParameters(
-                [{ type: "bytes" }],
-                log.data as Hex,
-              ) as [Hex];
-              signatures.add(extractEcdsaSignature(signedPayload));
-            }
-
-            return [...signatures];
-          }),
-        );
-
-        // If any input has no signature, the payload is not yet fully signed.
-        if (perInputSignatures.some((signatures) => !signatures.length)) {
-          return [];
-        }
-
-        const signerPublicKey = await getBitcoinSignerPubkey(chainId);
-
-        // Build one encoded withdrawal for a specific choice of signature per input.
-        const buildEncodedWithdrawal = (inputSignatures: string[]) =>
-          this._encodeBitcoinPsbtWithdrawal({
-            transactionData,
-            inputSignatures,
-            signerPublicKey,
-          });
-
-        // One candidate withdrawal per combination of per-input signatures
-        const combinations = cartesianProduct(perInputSignatures);
-        if (combinations.length > 100) {
-          throw internalError(
-            "Too many input signature combinations to process",
-          );
-        }
-
-        return combinations.map(buildEncodedWithdrawal);
-      }
-
-      default: {
-        throw externalError("Vm type not implemented");
-      }
-    }
   }
 
   private async _getEncodedWithdrawalV3(
@@ -2147,6 +2131,7 @@ export class AttestationService {
 
     switch (family) {
       case "ethereum-vm":
+      case "gateway-vm":
       case "hyperliquid-vm":
       case "lighter-vm":
       case "solana-vm":
@@ -2217,8 +2202,6 @@ export class AttestationService {
       inputs: { txid: Hex; index: Hex; script: Hex; value: Hex }[];
       outputs: { value: Hex; script: Hex }[];
     };
-    inputSignatures?: string[];
-    signerPublicKey?: Buffer;
   }): string {
     const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
     psbt.setVersion(1);
@@ -2237,18 +2220,6 @@ export class AttestationService {
           script: Buffer.from(input.script.slice(2), "hex"),
           value: this._fromBitcoinLittleEndian(input.value),
         },
-        ...(data.signerPublicKey
-          ? {
-              // The allocator pubkey is included so signers can identify inputs by key
-              bip32Derivation: [
-                {
-                  masterFingerprint: Buffer.alloc(4),
-                  path: "m",
-                  pubkey: data.signerPublicKey,
-                },
-              ],
-            }
-          : {}),
       });
     }
 
@@ -2257,30 +2228,6 @@ export class AttestationService {
         script: Buffer.from(output.script.slice(2), "hex"),
         value: this._fromBitcoinLittleEndian(output.value),
       });
-    }
-
-    if (data.inputSignatures) {
-      if (!data.signerPublicKey) {
-        throw internalError("Missing bitcoin signer public key");
-      }
-
-      for (let i = 0; i < data.inputSignatures.length; i++) {
-        const partialSig = psbt.data.inputs[i].partialSig ?? [];
-        const normalizedSignature = normalizeBitcoinPartialSignature(
-          data.inputSignatures[i],
-          bitcoin.Transaction.SIGHASH_ALL,
-        );
-
-        psbt.updateInput(i, {
-          partialSig: [
-            ...partialSig,
-            {
-              pubkey: data.signerPublicKey,
-              signature: normalizedSignature,
-            },
-          ],
-        });
-      }
     }
 
     return encodeWithdrawal({

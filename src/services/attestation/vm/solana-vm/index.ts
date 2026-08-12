@@ -20,6 +20,8 @@ import {
 import {
   PublicKey,
   Connection,
+  Finality,
+  SignatureStatus,
   SystemProgram,
   SystemInstruction,
   ComputeBudgetProgram,
@@ -30,8 +32,13 @@ import {
 import bs58 from "bs58";
 
 import { RelayDepositoryIdl } from "./idls/RelayDepositoryIdl";
-import { getDeterministicId } from "../../utils";
-import { EnhancedDepositoryDepositMessage, VmAttestor } from "../../vm/types";
+import type { TxHints } from "../..";
+import { getDeterministicId, selectFinalizationThreshold } from "../../utils";
+import {
+  DepositMode,
+  EnhancedDepositoryDepositMessage,
+  VmAttestor,
+} from "../../vm/types";
 import { getChain } from "../../../../common/chains";
 import { externalError, internalError } from "../../../../common/error";
 import { logger } from "../../../../common/logger";
@@ -42,6 +49,9 @@ const VM_TYPE = "solana-vm";
 
 // Direct transfers do not carry a deposit id, so we use the zero hash
 const ZERO_DEPOSIT_ID = "0x" + "0".repeat(64);
+
+// Any order-id-shaped token appearing in a memo
+const ORDER_ID_SCAN_REGEX = /0x[0-9a-fA-F]{64}/g;
 
 export class SolanaVmAttestor extends VmAttestor {
   private readonly instructionCoder: BorshInstructionCoder;
@@ -57,18 +67,34 @@ export class SolanaVmAttestor extends VmAttestor {
   public async getDepositoryDepositMessages(
     chainId: string,
     transactionId: string,
+    _hints?: TxHints,
+    opts?: { mode?: DepositMode },
   ): Promise<EnhancedDepositoryDepositMessage[]> {
     const trackingId = getTrackingId();
 
-    const rpc = await httpRpc(chainId, "finalized");
+    const chain = await getChain(chainId);
+
+    // The deposit amounts that pick the finality tier are unknown until the
+    // transaction is read, and "confirmed" is the lowest level the ledger serves
+    const fast = opts?.mode === "fast" && !!chain.additionalData?.fastMode;
+    const commitment: Finality = fast ? "confirmed" : "finalized";
+
+    const rpc = await httpRpc(chainId, commitment);
 
     await logRpcUsage(chainId, "getTransaction", trackingId);
     const transaction = await rpc.getTransaction(transactionId, {
       maxSupportedTransactionVersion: 0,
-      // Ensure the transaction is finalized
-      commitment: "finalized",
+      // Ensure the transaction reached the required commitment
+      commitment,
     });
     if (!transaction) {
+      // A known-but-unconfirmed transaction is retryable; an unknown one is not
+      if (
+        fast &&
+        (await this._measureFinality(chainId, transactionId, trackingId))
+      ) {
+        throw externalError(`Transaction ${transactionId} is not finalized`);
+      }
       return [];
     }
     if (transaction.meta?.err) {
@@ -82,8 +108,8 @@ export class SolanaVmAttestor extends VmAttestor {
       (await rpc
         .getBlock(transaction.slot, {
           maxSupportedTransactionVersion: 0,
-          // Ensure the block is finalized
-          commitment: "finalized",
+          // Ensure the block reached the required commitment
+          commitment,
         })
         .catch((error: any) => {
           logger.warn(
@@ -97,7 +123,6 @@ export class SolanaVmAttestor extends VmAttestor {
       throw externalError("Could not fetch the timestamp of the transaction");
     }
 
-    const chain = await getChain(chainId);
     const depository = chain.depository;
     if (!depository) {
       throw externalError("Chain has no depository configured");
@@ -378,7 +403,58 @@ export class SolanaVmAttestor extends VmAttestor {
       }
     }
 
+    // Finality checks
+    if (fast) {
+      const tiers = messages.map((m) =>
+        selectFinalizationThreshold(
+          chain,
+          m.result.currency,
+          BigInt(m.result.amount),
+        ),
+      );
+      const usedDefaults = tiers.some((tier) => !tier);
+      if (usedDefaults) {
+        // A deposit above every tier holds the whole transaction to "finalized"
+        const finality = await this._measureFinality(
+          chainId,
+          transactionId,
+          trackingId,
+        );
+        // Slot equality pins the finalization to the block the messages were read
+        // from; null only means the measurement failed - the read proved existence
+        if (
+          finality?.confirmationStatus !== "finalized" ||
+          finality.slot !== transaction.slot
+        ) {
+          throw externalError(`Transaction ${transactionId} is not finalized`);
+        }
+      }
+
+      messages.forEach((m, i) => {
+        m.extraData.mode = usedDefaults ? "slow" : "fast";
+        if (m.extraData.mode === "fast") {
+          m.extraData.fastFeeBps = tiers[i]?.feeBps;
+        }
+      });
+    }
+
     return messages;
+  }
+
+  // Measures the transaction's current commitment level without re-fetching it
+  private async _measureFinality(
+    chainId: string,
+    transactionId: string,
+    trackingId: string,
+  ): Promise<SignatureStatus | null> {
+    const rpc = await httpRpc(chainId, "confirmed");
+
+    await logRpcUsage(chainId, "getSignatureStatuses", trackingId);
+    const statuses = await rpc.getSignatureStatuses([transactionId], {
+      // Retries can arrive after the signature left the recent-status cache
+      searchTransactionHistory: true,
+    });
+    return statuses.value[0];
   }
 
   /**
@@ -424,15 +500,12 @@ export class SolanaVmAttestor extends VmAttestor {
       program.programId,
     );
 
-    let usedRequestState: { isUsed: boolean } | undefined;
-    try {
-      await logRpcUsage(chainId, "fetch", trackingId);
-      usedRequestState = await (program.account as any).usedRequest.fetch(
-        usedRequestPda,
-      );
-    } catch {
-      // Skip errors (`usedRequestState` will be undefined if not found)
-    }
+    await logRpcUsage(chainId, "fetch", trackingId);
+    // `fetchNullable` returns `null` only for a missing PDA, while RPC and decoding
+    // failures throw - a transient error must never expire an executed withdrawal
+    const usedRequestState: { isUsed: boolean } | null = await (
+      program.account as any
+    ).usedRequest.fetchNullable(usedRequestPda);
 
     let status: DepositoryWithdrawalStatus;
     if (usedRequestState && usedRequestState.isUsed) {
@@ -518,21 +591,38 @@ export class SolanaVmAttestor extends VmAttestor {
         trackingId,
       );
 
+    // The paid amount below is the recipient's whole balance delta, so a memo naming a
+    // second order would let this one payment be claimed by that order too.
     let hasOrderId = false;
+    const referencedOrderIds = new Set<string>();
     for (const instruction of instructions) {
       const programId = accountKeys[instruction.programIdIndex];
-      if (programId.toBase58() === MEMO_PROGRAM_ID.toBase58()) {
-        const ixData = Buffer.from(instruction.data).toString();
-        if (ixData.includes(payment.orderId)) {
-          hasOrderId = true;
-          break;
-        }
+      if (programId.toBase58() !== MEMO_PROGRAM_ID.toBase58()) {
+        continue;
+      }
+
+      const ixData = Buffer.from(instruction.data).toString();
+      if (ixData.includes(payment.orderId)) {
+        hasOrderId = true;
+      }
+      for (const [match] of ixData.matchAll(ORDER_ID_SCAN_REGEX)) {
+        referencedOrderIds.add(match.toLowerCase());
       }
     }
 
     if (!hasOrderId) {
       throw externalError(
         `Transaction ${transactionId} does not reference order id`,
+      );
+    }
+    if (referencedOrderIds.size > 1) {
+      logger.warn(
+        VM_TYPE,
+        JSON.stringify({
+          msg: "Transaction references multiple order ids; a fill should reference exactly one",
+          orderId: payment.orderId,
+          transactionId,
+        }),
       );
     }
 

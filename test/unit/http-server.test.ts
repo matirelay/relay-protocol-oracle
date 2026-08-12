@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import type { FastifyInstance } from "fastify";
 
-import { buildHttpServer } from "../../src/http-server";
+import { config } from "../../src/config";
+import {
+  buildHttpServer,
+  validateLocalOracleSigner,
+} from "../../src/http-server";
 
 jest.mock("../../src/api", () => ({
   setupEndpoints: (app: FastifyInstance) => {
@@ -12,10 +16,19 @@ jest.mock("../../src/api", () => ({
 jest.mock("../../src/config", () => ({
   config: {
     apiKeys: { "valid-key": "partner" },
+    httpPort: 0,
+    oracleSigners: undefined,
+    allocatorEventAttestation: false,
+    relayWsUrl: undefined,
     unauthenticatedRateLimitMax: 1,
     unauthenticatedRateLimitWindowMs: 60000,
   },
 }));
+
+const mockedConfig = config as typeof config & {
+  oracleSigners?: Set<string>;
+};
+const localSigner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 let httpServer: FastifyInstance;
 
@@ -58,5 +71,33 @@ describe("unauthenticated rate limiting", () => {
 
     expect(responses.map(({ statusCode }) => statusCode)).toEqual([200, 200]);
     expect(responses[0].headers["x-ratelimit-limit"]).toBeUndefined();
+  });
+});
+
+describe("local Oracle signer startup validation", () => {
+  beforeEach(() => {
+    mockedConfig.oracleSigners = undefined;
+  });
+
+  it("allows startup without an Oracle signer allowlist", () => {
+    expect(() => validateLocalOracleSigner(localSigner)).not.toThrow();
+  });
+
+  it("allows startup when the local signer is allowlisted", () => {
+    mockedConfig.oracleSigners = new Set([localSigner]);
+
+    expect(() =>
+      validateLocalOracleSigner(localSigner.toUpperCase()),
+    ).not.toThrow();
+  });
+
+  it("rejects startup when the local signer is not allowlisted", () => {
+    mockedConfig.oracleSigners = new Set([
+      "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ]);
+
+    expect(() => validateLocalOracleSigner(localSigner)).toThrow(
+      `Local oracle signer ${localSigner} is not included in ORACLE_SIGNERS`,
+    );
   });
 });

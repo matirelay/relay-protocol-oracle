@@ -157,8 +157,14 @@ export class TonVmAttestor extends VmAttestor {
     ) {
       return [];
     }
-    // bounce=true to uninit → TVM auto-refunds; would double-credit.
-    if (inMsg.info.bounce) {
+    // skipped/no-state with bounce=false still leaves value at an uninit
+    // depository. With bounce=true, TVM refunds it; attesting would double-credit.
+    if (
+      inMsg.info.bounce &&
+      tx.description.type === "generic" &&
+      tx.description.computePhase.type === "skipped" &&
+      tx.description.computePhase.reason === "no-state"
+    ) {
       return [];
     }
     // Only opcode 0 (text comment) is a native-TON deposit; jetton

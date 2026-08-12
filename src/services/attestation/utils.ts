@@ -1,13 +1,17 @@
-import { JsonRpcProvider } from "@near-js/providers";
-import * as bitcoin from "bitcoinjs-lib";
-import bs58 from "bs58";
 import crypto from "crypto";
-import { Address, fromHex, getContract, Hex, parseAbi } from "viem";
-import { publicKeyToAddress } from "viem/accounts";
+import {
+  Address,
+  encodeAbiParameters,
+  getContract,
+  Hex,
+  parseAbi,
+  parseAbiParameters,
+} from "viem";
 
-import { Chain, getChains, getHubInfo } from "../../common/chains";
+import { Chain } from "../../common/chains";
 import { internalError } from "../../common/error";
 import { getHubHttpRpc } from "../../common/hub";
+import { logger } from "../../common/logger";
 
 export const getDeterministicId = (...values: string[]) =>
   "0x" +
@@ -15,13 +19,6 @@ export const getDeterministicId = (...values: string[]) =>
     .createHash("sha256")
     .update(values.join(":").toLowerCase())
     .digest("hex");
-
-// Cartesian product of per-slot options. `[[a], [b1, b2]]` becomes `[[a, b1], [a, b2]]`
-export const cartesianProduct = <T>(lists: T[][]): T[][] =>
-  lists.reduce<T[][]>(
-    (acc, list) => acc.flatMap((combo) => list.map((item) => [...combo, item])),
-    [[]],
-  );
 
 // Select the matching finalization threshold based on the oracle's configuration
 export const selectFinalizationThreshold = (
@@ -73,7 +70,7 @@ export const resolveAmountTieredFinality = (
   defaults: { finalizationBlocks: number; finalizationTime: number },
 ): {
   required: { finalizationBlocks: number; finalizationTime: number };
-  usedDefaults: boolean;
+  mode: "fast" | "slow";
   tiers: ReturnType<typeof selectFinalizationThreshold>[];
 } => {
   const tiers = deposits.map((d) =>
@@ -97,247 +94,113 @@ export const resolveAmountTieredFinality = (
     );
   }
 
+  // Fast only when the resolved thresholds are within the defaults and strictly
+  // below in at least one dimension — a tier slower in either dimension is slow.
+  const isFaster =
+    finalizationBlocks <= defaults.finalizationBlocks &&
+    finalizationTime <= defaults.finalizationTime &&
+    (finalizationBlocks < defaults.finalizationBlocks ||
+      finalizationTime < defaults.finalizationTime);
+
   return {
-    required: {
-      finalizationBlocks,
-      finalizationTime,
-    },
-    usedDefaults:
-      finalizationBlocks >= defaults.finalizationBlocks &&
-      finalizationTime >= defaults.finalizationTime,
+    // A slow resolution must meet the chain-default finality — a misconfigured
+    // tier (e.g. fewer blocks but longer time) must not weaken the block gate.
+    required: isFaster
+      ? { finalizationBlocks, finalizationTime }
+      : { ...defaults },
+    mode: isFaster ? "fast" : "slow",
     tiers,
   };
 };
 
-// Build the rate-limiter's opaque `limiterData` and pre-check its budget off-chain (by limiter type)
+// Pre-check the rate-limiter's budget off-chain for a tx's fast deposits (by
+// limiter type) and resolve the data each FAST_MINT passes to consume()
 export const resolveRateLimiter = async (params: {
   type: string;
   address: string;
   chainId: string;
-  currency: string;
-  amount: string;
-}): Promise<{ rateLimiterData: string; withinBudget: boolean }> => {
-  const { type, address, chainId, currency, amount } = params;
+  entries: { tokenId: bigint; amount: bigint }[];
+}): Promise<{ withinBudget: boolean; rateLimiterData: Hex }> => {
+  const { type, address, chainId, entries } = params;
   switch (type) {
     case "amount": {
-      let withinBudget = true;
+      // Buckets are keyed by hub token id — sum amounts per token id so a tx
+      // that fits the budget per-message but not collectively is rejected
+      const amounts = new Map<bigint, bigint>();
+      for (const { tokenId, amount } of entries) {
+        amounts.set(tokenId, (amounts.get(tokenId) ?? 0n) + amount);
+      }
+
+      const checks = await Promise.all(
+        [...amounts].map(async ([tokenId, amount]) => {
+          let withinBudget = true;
+          try {
+            const limiter = getContract({
+              address: address as Address,
+              abi: parseAbi([
+                "function canConsume(uint256 tokenId, uint256 amount) view returns (bool)",
+              ]),
+              client: await getHubHttpRpc(),
+            });
+
+            withinBudget = await limiter.read.canConsume([tokenId, amount]);
+          } catch {
+            // Skip errors
+          }
+
+          return withinBudget;
+        }),
+      );
+
+      // The amount limiter's consume() ignores the data argument
+      return { withinBudget: checks.every(Boolean), rateLimiterData: "0x" };
+    }
+
+    case "usd": {
+      // The USD bucket is per-chain and shared by every token in the tx — one
+      // batched call prices and sums all entries like the per-action consume()s
+      const rateLimiterData = encodeAbiParameters(
+        parseAbiParameters("string chainId"),
+        [chainId],
+      );
+
       try {
         const limiter = getContract({
           address: address as Address,
           abi: parseAbi([
-            "function canConsume(string chainId, bytes currency, uint256 amount) view returns (bool)",
+            // Declared view locally (on-chain it is nonpayable, for stateful
+            // pricing) so the pre-check stays a plain eth_call read
+            "function resolveCanConsumeBatch(uint256[] tokenIds, uint256[] amounts, bytes data) view returns (bool)",
           ]),
           client: await getHubHttpRpc(),
         });
 
-        withinBudget = await limiter.read.canConsume([
-          chainId,
-          currency as Hex,
-          BigInt(amount),
+        const withinBudget = await limiter.read.resolveCanConsumeBatch([
+          entries.map((e) => e.tokenId),
+          entries.map((e) => e.amount),
+          rateLimiterData,
         ]);
-      } catch {
-        // Skip errors
+
+        return { withinBudget, rateLimiterData };
+      } catch (error) {
+        // Fail closed — the limiter cannot price the token or be read at
+        // all, so the deposit must not go fast
+        logger.warn(
+          "attestation-service",
+          JSON.stringify({
+            msg: "Fast mode rate-limiter pre-check failed",
+            chainId,
+            rateLimiter: address,
+            error: String(error),
+          }),
+        );
+
+        return { withinBudget: false, rateLimiterData };
       }
-
-      // TODO: Integrate rate-limiter
-      const rateLimiterData = "0x";
-
-      return { rateLimiterData, withinBudget };
     }
 
     default: {
       throw internalError(`Unsupported rate limiter type "${type}"`);
     }
   }
-};
-
-export const resolveFeeCalculator = async (params: {
-  type: string;
-  address: string;
-  chainId: string;
-  currency: string;
-  amount: string;
-}): Promise<{ feeCalculatorData: string }> => {
-  const { type } = params;
-  switch (type) {
-    case "bps": {
-      // TODO: Integrate fee-calculator
-      const feeCalculatorData = "0x";
-
-      return { feeCalculatorData };
-    }
-
-    default: {
-      throw internalError(`Unsupported fee calculator type "${type}"`);
-    }
-  }
-};
-
-export const extractEcdsaSignature = (rawNearSignature: string): string => {
-  const parsedSignature = JSON.parse(
-    fromHex(rawNearSignature as Hex, "string"),
-  );
-
-  const {
-    big_r: { affine_point },
-    s: { scalar },
-    recovery_id,
-  } = parsedSignature;
-
-  const r = affine_point.substring(2);
-  const s = scalar;
-  const v = recovery_id + 27;
-
-  return `0x${r}${s}${v.toString(16).padStart(2, "0")}`.toLowerCase();
-};
-
-let _getSignerCache = new Map<string, string>();
-let _getBitcoinSignerPubkeyCache = new Map<string, Buffer>();
-export const getSigner = async (chainId: string) => {
-  if (_getSignerCache.has(chainId)) {
-    return _getSignerCache.get(chainId)!;
-  }
-
-  const vmType = await getChains().then((chains) => chains[chainId].vmType);
-
-  let domainId: number | undefined;
-  switch (vmType) {
-    case "bitcoin-vm":
-    case "ethereum-vm":
-    case "hyperliquid-vm":
-    case "tron-vm": {
-      domainId = 0;
-      break;
-    }
-
-    case "solana-vm": {
-      domainId = 1;
-      break;
-    }
-
-    default: {
-      throw new Error("Vm type not implemented");
-    }
-  }
-
-  const hubInfo = await getHubInfo();
-  if (!hubInfo.auroraAllocatorAddress) {
-    throw new Error("Missing Aurora allocator config");
-  }
-
-  const args = {
-    domain_id: domainId,
-    path: hubInfo.auroraAllocatorAddress.toLowerCase(),
-    predecessor: `${hubInfo.auroraAllocatorAddress.slice(2).toLowerCase()}.aurora`,
-  };
-
-  const nearRpc = new JsonRpcProvider({
-    url: "https://free.rpc.fastnear.com",
-  });
-  const result = await nearRpc.callFunction(
-    "v1.signer",
-    "derived_public_key",
-    args,
-  );
-
-  const [, publicKey] = result!.toString().split(":");
-  switch (vmType) {
-    case "bitcoin-vm": {
-      const raw = Buffer.from(bs58.decode(publicKey));
-
-      const x = raw.subarray(0, 32);
-      const y = raw.subarray(32, 64);
-      const yIsEven = (y[31] & 1) === 0;
-      const prefix = yIsEven ? 0x02 : 0x03;
-      const pubKeyCompressed = Buffer.concat([
-        Buffer.from([prefix]),
-        Buffer.from(x),
-      ]);
-      _getBitcoinSignerPubkeyCache.set(chainId, pubKeyCompressed);
-
-      _getSignerCache.set(
-        chainId,
-        bitcoin.payments.p2pkh({
-          network: bitcoin.networks.bitcoin,
-          pubkey: pubKeyCompressed,
-        }).address!,
-      );
-
-      break;
-    }
-
-    case "ethereum-vm":
-    case "hyperliquid-vm":
-    case "tron-vm": {
-      _getSignerCache.set(
-        chainId,
-        publicKeyToAddress(
-          `0x04${Buffer.from(bs58.decode(publicKey)).toString("hex")}`,
-        ).toLowerCase(),
-      );
-
-      break;
-    }
-
-    case "solana-vm": {
-      _getSignerCache.set(chainId, publicKey);
-
-      break;
-    }
-
-    default: {
-      throw new Error("Vm type not implemented");
-    }
-  }
-
-  return _getSignerCache.get(chainId)!;
-};
-
-export const getBitcoinSignerPubkey = async (chainId: string) => {
-  if (!_getBitcoinSignerPubkeyCache.has(chainId)) {
-    await getSigner(chainId);
-  }
-
-  if (!_getBitcoinSignerPubkeyCache.has(chainId)) {
-    throw new Error("Bitcoin signer pubkey not found");
-  }
-
-  return Buffer.from(_getBitcoinSignerPubkeyCache.get(chainId)!);
-};
-
-const stripHexPrefix = (value: string) =>
-  value.startsWith("0x") ? value.slice(2) : value;
-
-export const normalizeBitcoinPartialSignature = (
-  signatureHex: string,
-  sighashType: number,
-): Buffer => {
-  const signature = Buffer.from(stripHexPrefix(signatureHex), "hex");
-
-  try {
-    bitcoin.script.signature.decode(signature);
-    return signature;
-  } catch {
-    // Continue to compact signature handling
-  }
-
-  if (signature.length === 64) {
-    return Buffer.from(bitcoin.script.signature.encode(signature, sighashType));
-  }
-
-  if (signature.length === 65) {
-    const hasRecoveryId = (value: number) => [0, 1, 27, 28].includes(value);
-    const compactSignature =
-      hasRecoveryId(signature[0]) && !hasRecoveryId(signature[64])
-        ? signature.subarray(1, 65)
-        : signature.subarray(0, 64);
-
-    return Buffer.from(
-      bitcoin.script.signature.encode(compactSignature, sighashType),
-    );
-  }
-
-  throw new Error(
-    `Invalid bitcoin signature format: expected DER+sighash, 64-byte compact, or 65-byte compact+recoveryId, got ${signature.length} bytes`,
-  );
 };

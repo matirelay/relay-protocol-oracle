@@ -12,7 +12,6 @@ const mockGetChain = jest.fn(async (chainId: string): Promise<Chain> => ({
   vmType: "evm" as VmType,
   httpRpcUrl: `https://rpc.example/${chainId}`,
   depository: undefined,
-  hubChainId: undefined,
   additionalData: undefined,
 }));
 
@@ -24,11 +23,6 @@ const mockGetHubInfo = jest.fn(async () => ({
   oracleAddress: "0x0000000000000000000000000000000000000002",
   oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
   genericMappingAddress: "0x0000000000000000000000000000000000000004",
-  auroraHttpRpcUrl: "https://aurora.example",
-  auroraEvmChainId: "1313161554",
-  auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-  auroraAllocatorSpenderAddress: "0x0000000000000000000000000000000000000006",
-  auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
 }));
 
 jest.mock("../../../src/common/chains", () => ({
@@ -42,8 +36,8 @@ import {
   __getCacheSize,
 } from "../../../src/common/vm/ethereum-vm/rpc";
 import {
+  getHubBatchHttpRpc,
   getHubHttpRpc,
-  getAuroraHttpRpc,
   __resetHubCache,
 } from "../../../src/common/hub";
 
@@ -56,7 +50,6 @@ describe("ethereum-vm rpc cache", () => {
       vmType: "evm" as VmType,
       httpRpcUrl: `https://rpc.example/${chainId}`,
       depository: undefined,
-      hubChainId: undefined,
       additionalData: undefined,
     }));
   });
@@ -102,19 +95,24 @@ describe("ethereum-vm rpc cache", () => {
   });
 });
 
-describe("hub.ts cache keyspace isolation", () => {
+describe("hub.ts rpc cache", () => {
   beforeEach(() => {
     __resetHubCache();
     mockGetHubInfo.mockClear();
   });
 
-  it("hub and aurora clients are distinct instances and each stable", async () => {
+  it("returns a stable hub client instance", async () => {
     const hub = await getHubHttpRpc();
-    const aurora = await getAuroraHttpRpc();
-    expect(hub).not.toBe(aurora);
     expect(await getHubHttpRpc()).toBe(hub);
-    expect(await getAuroraHttpRpc()).toBe(aurora);
-    // Both slots built exactly once.
+    expect(mockGetHubInfo).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a separate stable batched hub client", async () => {
+    const regular = await getHubHttpRpc();
+    const batched = await getHubBatchHttpRpc();
+
+    expect(await getHubBatchHttpRpc()).toBe(batched);
+    expect(batched).not.toBe(regular);
     expect(mockGetHubInfo).toHaveBeenCalledTimes(2);
   });
 });

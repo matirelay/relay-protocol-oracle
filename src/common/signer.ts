@@ -2,7 +2,6 @@ import {
   ExecuteAndWithdrawRequest,
   ExecutionMessage,
   GenericMappingMessage,
-  SubmitWithdrawRequest,
   WithdrawRequest,
 } from "@relay-protocol/settlement-sdk";
 import { Address, Hex, zeroAddress } from "viem";
@@ -42,75 +41,6 @@ export const signGenericMappingMessage = async (m: GenericMappingMessage) => {
   return {
     genericMappingChainId: BigInt(hubInfo.evmChainId),
     genericMappingContract: hubInfo.genericMappingAddress as Address,
-    oracleSigner: wallet.address.toLowerCase(),
-    signature,
-  };
-};
-
-export const signPayloadParams = async (m: SubmitWithdrawRequest) => {
-  const wallet = await getSigningWallet();
-
-  const hubInfo = await getHubInfo();
-
-  const signature = await wallet.signTypedData({
-    domain: {
-      chainId: BigInt(hubInfo.auroraEvmChainId),
-      name: "RelayAllocatorSpender",
-      verifyingContract: hubInfo.auroraAllocatorSpenderAddress as Address,
-      version: "1",
-    },
-    message: {
-      chainId: BigInt(m.chainId),
-      depository: m.depository,
-      currency: m.currency,
-      amount: BigInt(m.amount),
-      spender: m.spender as Address,
-      receiver: m.recipient,
-      data: m.data as Hex,
-      nonce: m.nonce as Hex,
-    },
-    primaryType: "SubmitWithdrawRequest",
-    types: {
-      SubmitWithdrawRequest: [
-        {
-          name: "chainId",
-          type: "uint256",
-        },
-        {
-          name: "depository",
-          type: "string",
-        },
-        {
-          name: "currency",
-          type: "string",
-        },
-        {
-          name: "amount",
-          type: "uint256",
-        },
-        {
-          name: "spender",
-          type: "address",
-        },
-        {
-          name: "receiver",
-          type: "string",
-        },
-        {
-          name: "data",
-          type: "bytes",
-        },
-        {
-          name: "nonce",
-          type: "bytes32",
-        },
-      ],
-    },
-  });
-
-  return {
-    allocatorSpenderChainId: BigInt(hubInfo.auroraEvmChainId),
-    allocatorSpenderContract: hubInfo.auroraAllocatorSpenderAddress as Address,
     oracleSigner: wallet.address.toLowerCase(),
     signature,
   };
@@ -328,6 +258,66 @@ export const signAllocatorWithdrawRequest = async (
   return {
     allocatorChainId: Number(hubInfo.evmChainId),
     allocatorContract: hubInfo.allocatorAddress,
+    oracleSigner: wallet.address.toLowerCase(),
+    signature,
+  };
+};
+
+// Signs the `PayGas` EIP-712 digest consumed by WithdrawGasPayer. The fee
+// fields are part of the signed message so the submitted currency and amount
+// cannot be changed after oracle authorization.
+export const signWithdrawGasPayment = async (
+  request: WithdrawRequest,
+  feeCurrency: string,
+  feeAmount: string,
+) => {
+  const wallet = await getSigningWallet();
+  const hubInfo = await getHubInfo();
+  if (!hubInfo.withdrawGasPayerAddress) {
+    throw new Error("Missing withdraw gas payer config");
+  }
+
+  const signature = await wallet.signTypedData({
+    domain: {
+      chainId: BigInt(hubInfo.evmChainId),
+      name: "WithdrawGasPayer",
+      verifyingContract: hubInfo.withdrawGasPayerAddress as Address,
+      version: "1",
+    },
+    message: {
+      chainId: request.chainId,
+      depository: request.depository as Hex,
+      currency: request.currency as Hex,
+      amount: BigInt(request.amount),
+      spenderChainId: request.spenderChainId,
+      spender: request.spender as Hex,
+      receiver: request.receiver as Hex,
+      data: request.data as Hex,
+      nonce: request.nonce as Hex,
+      feeCurrency: feeCurrency as Hex,
+      feeAmount: BigInt(feeAmount),
+    },
+    primaryType: "PayGas",
+    types: {
+      PayGas: [
+        { name: "chainId", type: "string" },
+        { name: "depository", type: "bytes" },
+        { name: "currency", type: "bytes" },
+        { name: "amount", type: "uint256" },
+        { name: "spenderChainId", type: "string" },
+        { name: "spender", type: "bytes" },
+        { name: "receiver", type: "bytes" },
+        { name: "data", type: "bytes" },
+        { name: "nonce", type: "bytes32" },
+        { name: "feeCurrency", type: "bytes" },
+        { name: "feeAmount", type: "uint256" },
+      ],
+    },
+  });
+
+  return {
+    gasPayerChainId: Number(hubInfo.evmChainId),
+    gasPayerContract: hubInfo.withdrawGasPayerAddress,
     oracleSigner: wallet.address.toLowerCase(),
     signature,
   };

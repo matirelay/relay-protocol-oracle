@@ -5,9 +5,10 @@ import { Order, getOrderId } from "@relay-protocol/settlement-sdk";
 
 import { validateRecoverMode } from "../../../src/common/recover-mode-verification";
 import { AttestationService } from "../../../src/services/attestation";
+import { getDeterministicId } from "../../../src/services/attestation/utils";
 import { getVmAttestor } from "../../../src/services/attestation/vm";
 import { Chain, getSdkChainsConfig } from "../../../src/common/chains";
-import { getBalanceOnHub, getHubHttpRpc } from "../../../src/common/hub";
+import { getHubHttpRpc } from "../../../src/common/hub";
 
 jest.mock("../../../src/services/attestation/vm");
 jest.mock("../../../src/common/chains");
@@ -32,14 +33,13 @@ jest.mock("../../../src/common/chains", () => {
       vmType: "ethereum-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "0x0987654321098765432109876543210987654321",
-      hubChainId: "1",
+      additionalData: { evmChainId: "1" },
     },
     solana: {
       id: "solana",
       vmType: "solana-vm",
       httpRpcUrl: "http://127.0.0.1:8899",
       depository: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
-      hubChainId: "1",
     },
   };
   return {
@@ -50,7 +50,6 @@ jest.mock("../../../src/common/chains", () => {
       if (chainId === "solana") return "solana-vm";
       throw new Error(`Unknown chain: ${chainId}`);
     }),
-    getChainHubChainId: jest.fn().mockImplementation(async () => 1),
     getHubInfo: jest.fn().mockImplementation(async () => ({
       id: "hub",
       evmChainId: "1",
@@ -60,12 +59,6 @@ jest.mock("../../../src/common/chains", () => {
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
       allocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress:
-        "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
     })),
     getSdkChainsConfig: jest.fn(() => ({
       ethereum: "ethereum-vm",
@@ -79,16 +72,20 @@ const mockGetVmAttestor = jest.mocked(getVmAttestor);
 describe("validateRecoverMode", () => {
   const service = new AttestationService();
 
+  // A slow refund returns a deposit to the address that made it, so depositor,
+  // owner and refund recipient are necessarily the same address.
   // Use lowercase canonical form for the order; tests will check that
   // checksum-cased params still match.
-  const depositor = "0x1234567890123456789012345678901234567890";
+  const depositor = "0xaaaabbbbccccddddeeeeffff0011223344556677";
   // Order data sent to the oracle is the raw form built by the solver
   // (chain-native addresses — `normalizeOrder` only runs inside `getOrderId`
   // for hashing, never mutates the stored Order). For ethereum-vm this means
   // refund addresses can be checksum or lowercase; the encode-based compare
   // must tolerate either side appearing in either form.
-  const refundRecipientLower = "0xaaaabbbbccccddddeeeeffff0011223344556677";
+  const refundRecipientLower = depositor;
   const refundRecipientChecksum = "0xaaAAbbBBccCCddDDeeEEffff0011223344556677";
+  // A recipient that is not the depositor — never valid for a slow refund.
+  const strangerRecipient = "0x1234567890123456789012345678901234567890";
   const solver = "0x0987654321098765432109876543210987654321";
   const currencyLower = "0xdac17f958d2ee523a2206206994597c13d831ec7"; // USDT lowercase
   const currencyChecksum = "0xdAC17F958D2ee523a2206206994597C13D831ec7"; // USDT checksum
@@ -153,18 +150,28 @@ describe("validateRecoverMode", () => {
     };
   };
 
-  const buildDeposit = (overrides?: { depositId?: Hex; amount?: string }) => ({
-    data: { chainId: depositChainId, transactionId },
+  const buildDeposit = (overrides?: {
+    depositId?: Hex;
+    amount?: string;
+    chainId?: string;
+    currency?: string;
+    depositor?: string;
+  }) => ({
+    data: { chainId: overrides?.chainId ?? depositChainId, transactionId },
     result: {
-      depositor,
+      depositor: overrides?.depositor ?? depositor,
       depository: "0x0987654321098765432109876543210987654321",
-      currency: currencyLower,
+      currency: overrides?.currency ?? currencyLower,
       amount: overrides?.amount ?? amount,
       onchainId,
       depositId: overrides?.depositId ?? keccak256("0xdead" as Hex),
     },
     extraData: { timestamp: String(Math.floor(Date.now() / 1000)) },
   });
+
+  // recoverMode nonces are derived from the deposit rather than caller-chosen,
+  // so one deposit authorizes exactly one withdrawal (see DEC-1660).
+  const depositNonce = getDeterministicId(onchainId, "recover-withdrawal");
 
   const setupMockAttestor = (messages: ReturnType<typeof buildDeposit>[]) => {
     const mockAttestor: any = {
@@ -182,7 +189,6 @@ describe("validateRecoverMode", () => {
     jest.mocked(getHubHttpRpc).mockResolvedValue({
       readContract: jest.fn<any>().mockResolvedValue(["0x01", 1000n]),
     } as any);
-    jest.mocked(getBalanceOnHub).mockResolvedValue(10000n);
     jest.mocked(verifyMessage).mockResolvedValue(true);
   });
 
@@ -210,7 +216,7 @@ describe("validateRecoverMode", () => {
         order,
         ...baseParams,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBeDefined();
   });
 
   it("rejects when amount does not equal deposit amount (F-001)", async () => {
@@ -242,7 +248,7 @@ describe("validateRecoverMode", () => {
         ...baseParams,
         recipient: refundRecipientChecksum,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBeDefined();
   });
 
   it("matches currency when order is lowercase and caller passes checksum", async () => {
@@ -257,7 +263,7 @@ describe("validateRecoverMode", () => {
         ...baseParams,
         currency: currencyChecksum,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBeDefined();
   });
 
   it("matches currency when order is checksum and caller passes lowercase", async () => {
@@ -272,7 +278,7 @@ describe("validateRecoverMode", () => {
         ...baseParams,
         currency: currencyLower,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBeDefined();
   });
 
   it("rejects when currency does not match any refund entry", async () => {
@@ -292,7 +298,83 @@ describe("validateRecoverMode", () => {
 
   // Cross-VM coverage: exercises the bs58 → bytes → hex path inside
   // `encodeAddress` to confirm the comparison works for non-EVM VMs.
+  // A Solana deposit recovered back to the depositing address — the withdrawal
+  // chain, currency and owner all track the deposit.
+  const solanaParams = {
+    ...baseParams,
+    chainId: "solana",
+    depositChainId: "solana",
+    ownerChainId: "solana",
+    owner: solRecipient,
+    recipient: solRecipient,
+    currency: solUsdcMint,
+  };
+
+  const buildSolanaDeposit = (depositId: Hex) =>
+    buildDeposit({
+      depositId,
+      chainId: "solana",
+      currency: solUsdcMint,
+      depositor: solRecipient,
+    });
+
   it("matches Solana base58 currency end-to-end (happy path)", async () => {
+    const order = buildOrder({
+      refundChainId: "solana",
+      refundRecipient: solRecipient,
+      refundCurrency: solUsdcMint,
+    });
+    const orderId = getOrderId(order, await getSdkChainsConfig());
+    setupMockAttestor([buildSolanaDeposit(orderId)]);
+
+    await expect(
+      validateRecoverMode({
+        attestationService: service,
+        order,
+        ...solanaParams,
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("rejects when Solana currency is a different mint", async () => {
+    const order = buildOrder({
+      refundChainId: "solana",
+      refundRecipient: solRecipient,
+      refundCurrency: solUsdcMint,
+    });
+    const orderId = getOrderId(order, await getSdkChainsConfig());
+    setupMockAttestor([buildSolanaDeposit(orderId)]);
+
+    await expect(
+      validateRecoverMode({
+        attestationService: service,
+        order,
+        ...solanaParams,
+        currency: solUsdtMint, // valid base58, but wrong mint
+      }),
+    ).rejects.toThrow(/Expected exactly 1 refund entry/);
+  });
+
+  it("rejects multi-input orders", async () => {
+    const order = buildOrder({ inputCount: 2 });
+    setupMockAttestor([buildDeposit()]);
+
+    await expect(
+      validateRecoverMode({
+        attestationService: service,
+        order,
+        ...baseParams,
+      }),
+    ).rejects.toThrow(/single-input/);
+  });
+
+  // DEC-1660: recoverMode must move the funds of the deposit it cites, exactly
+  // once. Without these bindings a single deposit authorizes repeated
+  // withdrawals of an arbitrary currency out of the owner's pooled alias.
+
+  it("rejects when the withdrawal chain differs from the deposit chain", async () => {
+    // Refund entry is on solana so the refund lookup succeeds; only the
+    // withdrawal chain diverges from the ethereum deposit.
     const order = buildOrder({
       refundChainId: "solana",
       refundRecipient: solRecipient,
@@ -310,15 +392,36 @@ describe("validateRecoverMode", () => {
         recipient: solRecipient,
         currency: solUsdcMint,
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow(/Withdrawal chain does not match the deposit chain/);
   });
 
-  it("rejects when Solana currency is a different mint", async () => {
-    const order = buildOrder({
-      refundChainId: "solana",
-      refundRecipient: solRecipient,
-      refundCurrency: solUsdcMint,
-    });
+  it("rejects when the withdrawal currency differs from the deposit currency", async () => {
+    // The refund entry names the requested currency, so the only mismatch left
+    // is against the currency actually deposited.
+    const order = buildOrder({ refundCurrency: currencyLower });
+    const orderId = getOrderId(order, await getSdkChainsConfig());
+    setupMockAttestor([
+      buildDeposit({
+        depositId: orderId,
+        currency: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      }),
+    ]);
+
+    await expect(
+      validateRecoverMode({
+        attestationService: service,
+        order,
+        ...baseParams,
+      }),
+    ).rejects.toThrow(
+      /Withdrawal currency does not match the deposit currency/,
+    );
+  });
+
+  it("returns the nonce derived from the deposit", async () => {
+    // The caller does not choose it: one deposit maps to one withdraw request
+    // hash, so the Hub rejects replays of the same recovery.
+    const order = buildOrder();
     const orderId = getOrderId(order, await getSdkChainsConfig());
     setupMockAttestor([buildDeposit({ depositId: orderId })]);
 
@@ -327,24 +430,25 @@ describe("validateRecoverMode", () => {
         attestationService: service,
         order,
         ...baseParams,
-        chainId: "solana",
-        recipient: solRecipient,
-        currency: solUsdtMint, // valid base58, but wrong mint
       }),
-    ).rejects.toThrow(/Expected exactly 1 refund entry/);
+    ).resolves.toEqual({ nonce: depositNonce });
   });
 
-  it("rejects multi-input orders", async () => {
-    const order = buildOrder({ inputCount: 2 });
-    setupMockAttestor([buildDeposit()]);
+  it("rejects when the recipient is not the depositor", async () => {
+    // Both the order refund entry and the request name the same recipient, so
+    // the only failure left is that it is not the address that deposited.
+    const order = buildOrder({ refundRecipient: strangerRecipient });
+    const orderId = getOrderId(order, await getSdkChainsConfig());
+    setupMockAttestor([buildDeposit({ depositId: orderId })]);
 
     await expect(
       validateRecoverMode({
         attestationService: service,
         order,
         ...baseParams,
+        recipient: strangerRecipient,
       }),
-    ).rejects.toThrow(/single-input/);
+    ).rejects.toThrow(/Recipient is not the deposit's depositor/);
   });
 
   it("rejects when any recoverMode field is missing", async () => {

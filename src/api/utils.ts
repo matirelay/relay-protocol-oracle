@@ -1,11 +1,5 @@
 import { Type, type TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
-import {
-  ExecutionMessage,
-  ExecuteAndWithdrawRequest,
-  GenericMappingMessage,
-  SubmitWithdrawRequest,
-} from "@relay-protocol/settlement-sdk";
-import axios from "axios";
+import type { TUnsafe } from "@sinclair/typebox";
 import type {
   ContextConfigDefault,
   FastifyReply,
@@ -21,7 +15,6 @@ import type { FastifySchema } from "fastify/types/schema";
 import { isExternalError } from "../common/error";
 import { logger } from "../common/logger";
 import { sanitizeError } from "../common/sanitize-error";
-import { config } from "../config";
 
 export type FastifyRequestTypeBox<TSchema extends FastifySchema> =
   FastifyRequest<
@@ -90,7 +83,61 @@ export const errorWrapper = (
 
 // BigInt is serialized as string in JSON, but TypeBox doesn't have a native BigInt type
 // This creates a custom type that tells TypeScript to expect bigint while serializing as string
-export const BigIntString = Type.Unsafe<bigint>({ type: "string" });
+export const BigIntString = Type.String() as unknown as TUnsafe<bigint>;
+
+export const depositModeSchema = Type.Union(
+  [Type.Literal("fast"), Type.Literal("slow")],
+  {
+    description:
+      "Attestation mode (default slow): 'slow' waits for full finalization, 'fast' might not wait for full finalization (depending on the oracle's configuration)",
+  },
+);
+
+export const feeCommitmentSchema = Type.Object(
+  {
+    payer: Type.Object(
+      {
+        chainId: Type.String({
+          description: "The chain of the payer wallet",
+        }),
+        address: Type.String({
+          description:
+            "The payer wallet address on that chain — the fee is charged from its hub alias",
+        }),
+      },
+      {
+        description: "The wallet paying the fast attestation fee",
+      },
+    ),
+    fee: Type.Object(
+      {
+        chainId: Type.String({
+          description: "The chain of the fee currency",
+        }),
+        currency: Type.String({
+          description: "The fee currency address on that chain",
+        }),
+        maxAmount: Type.String({
+          description:
+            "Payer-signed cap on the fee per deposit, enforced on-chain by the fee calculator",
+        }),
+      },
+      {
+        description: "The fee terms the payer signed",
+      },
+    ),
+    deadline: Type.String({
+      description: "Commitment expiry (epoch seconds)",
+    }),
+    signature: Type.String({
+      description: "The payer's EIP-712 signature over the commitment",
+    }),
+  },
+  {
+    description:
+      "Signed commitment authorizing the fast attestation fee to be charged to the payer (required when the resolved fast tier carries a non-zero fee)",
+  },
+);
 
 export const orderSchema = Type.Object(
   {
@@ -264,7 +311,8 @@ export const withdrawRequestAdditionalDataSchema = Type.Object(
     "xrp-vm": Type.Optional(
       Type.Object({
         sequence: Type.Number({
-          description: "The depository account sequence consumed by the withdrawal",
+          description:
+            "The depository account sequence consumed by the withdrawal",
         }),
         fee: Type.Union([Type.String(), Type.Number()], {
           description: "The transaction fee in drops",
@@ -276,8 +324,107 @@ export const withdrawRequestAdditionalDataSchema = Type.Object(
         destinationTag: Type.Optional(Type.Number()),
       }),
     ),
+    "gateway-vm": Type.Optional(
+      Type.Object({
+        allocator: Type.String({
+          description: "Gateway allocator / Circle delegate address",
+        }),
+        destinationChainId: Type.String({
+          description:
+            "Relay destination chain id for the Gateway withdrawal (must match the order's destination chain)",
+        }),
+        maxBlockHeight: Type.String({
+          description: "Circle Gateway BurnIntent max block height",
+        }),
+        destinationData: Type.Optional(
+          Type.Object({
+            vmType: Type.Literal("ethereum-vm"),
+            router: Type.String({
+              description:
+                "Allowlisted destination router that executes the committed calls",
+            }),
+            calls: Type.Array(
+              Type.Object({
+                to: Type.String({
+                  description: "Destination call target",
+                }),
+                data: Type.String({
+                  description: "Destination call calldata",
+                }),
+                value: Type.String({
+                  description: "Native currency value sent with the call",
+                }),
+                allowFailure: Type.Boolean({
+                  description:
+                    "Whether the routed withdrawal may continue if the call fails",
+                }),
+              }),
+              { minItems: 1 },
+            ),
+          }),
+        ),
+      }),
+    ),
   },
   { description: "Additional data for normalizing a withdraw request" },
+);
+
+export const withdrawRequestSchema = Type.Object({
+  chainId: Type.String({
+    description: "The chain id to withdraw on",
+  }),
+  depository: Type.Optional(
+    Type.String({
+      description:
+        "The depository to withdraw from (defaults to the chain's primary depository)",
+    }),
+  ),
+  currency: Type.String({
+    description: "The currency to withdraw",
+  }),
+  amount: Type.String({
+    description: "The amount to withdraw",
+  }),
+  spenderChainId: Type.String({
+    description: "The chain id of the spender",
+  }),
+  spender: Type.String({
+    description: "The spender address",
+  }),
+  receiver: Type.String({
+    description: "The withdrawal recipient",
+  }),
+  nonce: Type.String({
+    description: "Nonce for replay protection",
+  }),
+  additionalData: Type.Optional(withdrawRequestAdditionalDataSchema),
+});
+
+export const normalizedWithdrawRequestSchema = Type.Object({
+  chainId: Type.String({ description: "The withdraw chain id" }),
+  depository: Type.String({ description: "The encoded depository address" }),
+  currency: Type.String({ description: "The encoded currency address" }),
+  amount: Type.String({ description: "The withdrawal amount" }),
+  spenderChainId: Type.String({ description: "The spender (owner) chain id" }),
+  spender: Type.String({ description: "The encoded spender (owner) address" }),
+  receiver: Type.String({ description: "The encoded recipient address" }),
+  data: Type.String({ description: "The encoded withdrawal data" }),
+  nonce: Type.String({ description: "Nonce for replay protection" }),
+});
+
+export const signatureMetadataSchema = Type.Optional(
+  Type.Object({
+    "ton-vm": Type.Optional(
+      Type.Object({
+        timestamp: Type.Number({
+          description: "Unix seconds from the TonConnect signData response",
+        }),
+        domain: Type.String({
+          description: "Domain from the TonConnect signData response",
+        }),
+      }),
+    ),
+  }),
 );
 
 export const executionSchema = Type.Optional(
@@ -330,7 +477,7 @@ export const executeAndWithdrawRequestSchema = Type.Object({
   deadline: Type.String(),
   signatures: Type.Array(
     Type.Object({
-      executorChainId: Type.Unsafe<bigint>({ type: "string" }),
+      executorChainId: BigIntString,
       executorContract: Type.String(),
       oracleSigner: Type.String(),
       signature: Type.String(),
@@ -338,256 +485,3 @@ export const executeAndWithdrawRequestSchema = Type.Object({
     { minItems: 1 },
   ),
 });
-
-// Utility for comparing two execution messages
-export const areExecutionsEqual = (
-  msg1?: ExecutionMessage,
-  msg2?: ExecutionMessage,
-) => {
-  if (!msg1 || !msg2) {
-    return false;
-  }
-
-  return (
-    msg1.idempotencyKey === msg2.idempotencyKey &&
-    msg1.actions.length === msg2.actions.length &&
-    msg1.actions.every((_, i) => msg1.actions[i] === msg2.actions[i])
-  );
-};
-
-// Keeps only peer signatures bound to the SAME EIP-712 domain as our own
-// signature — i.e. the same verifying contract and chain id. The verifying
-// contract address is part of the EIP-712 domain separator (see the signers in
-// `common/signer.ts`), so a peer signing against a different contract address
-// produces signatures that recover to a different digest and are invalid on our
-// contract. This happens, for example, during a contract migration where some
-// signers still attest using the old contract address: bundling their
-// signatures would let the multisig threshold appear satisfied while silently
-// failing verification on-chain. This is NOT covered by the message-equality
-// checks (`areExecutionsEqual` et al.) because the domain contract lives on the
-// signature object, not the attested message. Applied at the aggregation site,
-// so peer signatures over a mismatched domain are dropped before bundling.
-export const filterSignaturesByDomain = (
-  signatures: any[] | undefined,
-  reference: Record<string, unknown>,
-  fields: { chainId: string; contract: string },
-): any[] => {
-  const referenceContract = reference[fields.contract];
-  if (typeof referenceContract !== "string") {
-    return [];
-  }
-
-  const refChainId = String(reference[fields.chainId]);
-  const refContract = referenceContract.toLowerCase();
-
-  return (signatures ?? []).filter((sig) => {
-    const contract = sig?.[fields.contract];
-    return (
-      String(sig?.[fields.chainId]) === refChainId &&
-      typeof contract === "string" &&
-      contract.toLowerCase() === refContract
-    );
-  });
-};
-
-// Utility for comparing two payload params (ignoring signatures)
-export const arePayloadParamsEqual = (
-  msg1?: SubmitWithdrawRequest,
-  msg2?: SubmitWithdrawRequest,
-) => {
-  if (!msg1 || !msg2) {
-    return false;
-  }
-
-  return (
-    msg1.chainId === msg2.chainId &&
-    msg1.depository === msg2.depository &&
-    msg1.currency === msg2.currency &&
-    msg1.amount === msg2.amount &&
-    msg1.spender === msg2.spender &&
-    msg1.recipient === msg2.recipient &&
-    msg1.nonce === msg2.nonce &&
-    msg1.data === msg2.data
-  );
-};
-
-// Utility for comparing two generic mappings (ignoring signatures)
-export const areGenericMappingsEqual = (
-  msg1?: GenericMappingMessage,
-  msg2?: GenericMappingMessage,
-) => {
-  if (!msg1 || !msg2) {
-    return false;
-  }
-
-  return (
-    msg1.user === msg2.user &&
-    msg1.id === msg2.id &&
-    msg1.data === msg2.data &&
-    msg1.nonce === msg2.nonce
-  );
-};
-
-// Utility for comparing two execute-and-withdraw requests (ignoring signatures)
-export const areExecuteAndWithdrawRequestsEqual = (
-  msg1?: ExecuteAndWithdrawRequest,
-  msg2?: ExecuteAndWithdrawRequest,
-) => {
-  if (!msg1 || !msg2) {
-    return false;
-  }
-
-  return (
-    msg1.inChainId === msg2.inChainId &&
-    msg1.inCurrency === msg2.inCurrency &&
-    msg1.outChainId === msg2.outChainId &&
-    msg1.outCurrency === msg2.outCurrency &&
-    msg1.outAmountMinimum === msg2.outAmountMinimum &&
-    msg1.depository === msg2.depository &&
-    msg1.orderAddress === msg2.orderAddress &&
-    msg1.receiver === msg2.receiver &&
-    msg1.data === msg2.data &&
-    msg1.fees.length === msg2.fees.length &&
-    msg1.fees.every(
-      (fee, i) =>
-        fee.recipient === msg2.fees[i].recipient &&
-        fee.amount === msg2.fees[i].amount,
-    ) &&
-    msg1.nonce === msg2.nonce &&
-    msg1.deadline === msg2.deadline
-  );
-};
-
-/** Fan out the same attestation request to peer oracles and collect only
- * signatures whose execution payload matches the local execution. Failures and
- * timeouts are logged and skipped so one unhealthy peer does not fail the
- * entire request path.
- *
- * When `ORACLE_SIGNERS` is set, returns as soon as `threshold` unique
- * multisig-eligible signers have responded. Falls back to waiting for all
- * peers when below target — never errors.
- */
-export const getPeerResponses = async ({
-  endpointPath,
-  requestBody,
-  requestApiKey,
-  validateAndExtractResponse,
-  getSigner,
-}: {
-  endpointPath: string;
-  requestBody: Record<string, unknown>;
-  requestApiKey?: string | string[];
-  // Returns the list of items to collect from a peer response. Items are
-  // usually signature objects (one per peer), but can be any shape — e.g.
-  // endpoints producing multiple signed messages return the whole payload.
-  validateAndExtractResponse: (peerData: any) => any[];
-  // Derives the dedup/threshold signer key from a collected item. Defaults to
-  // reading `oracleSigner` off the item (the signature-object shape). Override
-  // when items are not bare signatures (e.g. multi-message payloads).
-  getSigner?: (item: any) => string | undefined;
-}): Promise<any[]> => {
-  if (!config.peers) {
-    return [];
-  }
-
-  const { oracleSigners: signers, oracleSignersThreshold: threshold } = config;
-  if (signers && threshold === 0) {
-    return [];
-  }
-
-  // Dedupe by signer (multisig rejects duplicates); resolve `enough` once
-  // `matched` unique eligible signers arrive, so we stop waiting for dead peers.
-  const collected: any[] = [];
-  const seen = new Set<string>();
-  let matched = 0;
-  let resolveEnough!: () => void;
-  const enough = new Promise<void>((r) => (resolveEnough = r));
-
-  const resolveSigner = getSigner ?? ((item: any) => item?.oracleSigner);
-  const record = (items: any[]) => {
-    for (const item of items) {
-      const raw = resolveSigner(item);
-      const signer = typeof raw === "string" ? raw.toLowerCase() : undefined;
-      if (signers && signer) {
-        if (seen.has(signer)) {
-          continue;
-        }
-        seen.add(signer);
-
-        if (signers.has(signer)) {
-          matched++;
-        }
-      }
-
-      collected.push(item);
-    }
-
-    if (signers && matched >= threshold) {
-      resolveEnough();
-    }
-  };
-
-  const peerEntries = Object.entries(config.peers);
-  const peerDone = peerEntries.map(async ([url, apiKey]) => {
-    const start = Date.now();
-    return axios
-      .post(
-        `${url}${endpointPath}`,
-        { ...requestBody, requestPeerSignatures: false },
-        {
-          headers: {
-            "x-api-key": apiKey === "pass-through" ? requestApiKey : apiKey,
-          },
-          timeout: config.peerRequestTimeoutMs,
-        },
-      )
-      .then((response) => {
-        const durationMs = Date.now() - start;
-        logger[durationMs > 5000 ? "warn" : "info"](
-          "oracle-peer",
-          JSON.stringify({
-            msg: "Peer request completed",
-            endpointPath,
-            url,
-            durationMs,
-            data: response.data,
-            status: response.status,
-          }),
-        );
-        try {
-          record(validateAndExtractResponse(response.data));
-        } catch (error: any) {
-          logger.warn(
-            "oracle-peer",
-            JSON.stringify({
-              msg: "Skipping peer signature (validator error)",
-              endpointPath,
-              url,
-              durationMs: Date.now() - start,
-              error: String(error),
-              stack: error.stack,
-            }),
-          );
-        }
-      })
-      .catch((error: any) => {
-        logger.warn(
-          "oracle-peer",
-          JSON.stringify({
-            msg: "Skipping peer signature",
-            endpointPath,
-            url,
-            durationMs: Date.now() - start,
-            timeoutMs: config.peerRequestTimeoutMs,
-            error: String(error),
-            errorResponse: error?.response?.data ?? error?.response?.body,
-            stack: error.stack,
-          }),
-        );
-      });
-  });
-
-  // Resolve as soon as `enough` fires (threshold met) or all peers settle.
-  await Promise.race([enough, Promise.allSettled(peerDone)]);
-  return [...collected];
-};

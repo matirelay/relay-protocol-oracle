@@ -49,7 +49,7 @@ jest.mock("../../../../src/common/chains", () => {
       vmType: "ethereum-vm",
       httpRpcUrl: "http://127.0.0.1:8545",
       depository: "0x2e988a386a799f506693793c6a5af6b54dfaabfb",
-      hubChainId: "1",
+      additionalData: { evmChainId: "1" },
     },
   };
   return {
@@ -64,12 +64,6 @@ jest.mock("../../../../src/common/chains", () => {
       oracleAddress: "0x0000000000000000000000000000000000000002",
       oracleMultisigAddress: "0x0000000000000000000000000000000000000003",
       genericMappingAddress: "0x0000000000000000000000000000000000000004",
-      auroraHttpRpcUrl: "http://localhost:8545",
-      auroraEvmChainId: "1313161554",
-      auroraAllocatorAddress: "0x0000000000000000000000000000000000000005",
-      auroraAllocatorSpenderAddress:
-        "0x0000000000000000000000000000000000000006",
-      auroraOracleMultisigAddress: "0x0000000000000000000000000000000000000007",
       rateLimiter: {
         address: "0x00000000000000000000000000000000000000aa",
         type: "amount",
@@ -78,8 +72,6 @@ jest.mock("../../../../src/common/chains", () => {
     getChain: async (chainId: string) => chains[chainId],
     getChainVmType: async (chainId: string) =>
       chainId === "base" ? "ethereum-vm" : chains[chainId].vmType,
-    getChainHubChainId: async (chainId: string) =>
-      chainId === "base" ? "8453" : chains[chainId].hubChainId,
     getSdkChainsConfig: () =>
       Object.fromEntries(
         Object.values(chains).map((chain) => [chain.id, chain.vmType]),
@@ -533,6 +525,71 @@ const getBlockMock = async (data?: any) => {
 };
 
 describe("EthereumVmAttestor", () => {
+  it("rejects transaction ids which alias to the same transaction", async () => {
+    const chains = Object.values(await getChains());
+
+    const chain = chains[randomNumber(chains.length)];
+    const transactionHash = randomHex(32);
+
+    const from = randomHex(20);
+    const token = randomHex(20);
+    const amount = randomNumber(1e10).toString();
+
+    // Mock a valid deposit so only the id check can reject the aliases
+    const transferLog = generateTransferLog({
+      transactionHash,
+      logIndex: 0,
+      from,
+      to: chain.depository!,
+      token,
+      amount,
+    });
+    const transactionReceipt = generateTransactionReceipt(transactionHash, [
+      transferLog,
+    ]);
+
+    (httpRpc as jest.Mock).mockImplementation(() => ({
+      getBlock: getBlockMock,
+      getTransaction: async () => ({ input: "0x" }),
+      getTransactionReceipt: async () => transactionReceipt,
+    }));
+
+    const attestor = new EthereumVmAttestor();
+    for (const aliased of [
+      transactionHash.slice(2),
+      `${transactionHash} `,
+      `${transactionHash}\n`,
+      `${transactionHash}deadbeef`,
+      `0x${transactionHash}`,
+      `0x${transactionHash.slice(2).toUpperCase()}`,
+    ]) {
+      await expect(
+        attestor.getDepositoryDepositMessages(chain.id, aliased),
+      ).rejects.toThrow(/Invalid ethereum-vm transaction id/);
+    }
+
+    await expect(
+      attestor.getDepositoryDepositMessages(chain.id, transactionHash),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("rejects a non-canonical transaction id on the fill path", async () => {
+    const attestor = new EthereumVmAttestor();
+    await expect(
+      attestor.getSolverPaidAmount("base", randomHex(32).slice(2), {
+        currency: "0x0000000000000000000000000000000000000000",
+        recipient: randomHex(20),
+        orderId: `0x${"ab".repeat(32)}`,
+        extraData: "0x",
+        deadline: 9999999999,
+      }),
+    ).rejects.toThrow(/Invalid ethereum-vm transaction id/);
+
+    await expect(
+      attestor.verifySolverCalls("base", randomHex(32).slice(2), [], "0x"),
+    ).rejects.toThrow(/Invalid ethereum-vm transaction id/);
+  });
+
   it("attestDepositoryDeposits - single Transfer event", async () => {
     const chains = Object.values(await getChains());
 
@@ -1252,6 +1309,7 @@ describe("EthereumVmAttestor", () => {
           {
             to: randomHex(20),
             data: randomHex(64),
+            dataHash: zeroHash,
             value: randomNumber(ONE_BILLION).toString(),
             allowFailure: false,
           },
@@ -1293,6 +1351,7 @@ describe("EthereumVmAttestor", () => {
           {
             to: randomHex(20),
             data: randomHex(64),
+            dataHash: zeroHash,
             value: randomNumber(ONE_BILLION).toString(),
             allowFailure: false,
           },
@@ -1340,6 +1399,7 @@ describe("EthereumVmAttestor", () => {
           {
             to: randomHex(20),
             data: randomHex(64),
+            dataHash: zeroHash,
             value: randomNumber(ONE_BILLION).toString(),
             allowFailure: false,
           },

@@ -26,7 +26,16 @@ import {
 } from "ripple-keypairs";
 
 import { Chain } from "../../../src/common/chains";
-import type { OwnerSignatureData } from "../../../src/common/signature-verification";
+import type {
+  GasPaymentSignatureData,
+  TransferSignatureData,
+  WithdrawalSignatureData,
+} from "../../../src/common/signature-verification";
+
+type TestSignatureData =
+  | (WithdrawalSignatureData & { operation: "withdrawal" })
+  | (TransferSignatureData & { operation: "transfer" })
+  | (GasPaymentSignatureData & { operation: "gas-payment" });
 
 // Mock chains module
 const mockChains: Record<string, Chain> = {};
@@ -81,7 +90,22 @@ jest.mock("../../../src/common/vm/lighter-vm/rpc", () => ({
   }),
 }));
 
-import { verifyOwnerSignature } from "../../../src/common/signature-verification";
+// Mock the RPC-based viem verifyMessage action (EIP-1271 path for
+// smart-contract wallets) — unit tests have no EVM node, so the mock controls
+// the on-chain verification result.
+const mockVerifyMessageOnchain =
+  jest.fn<(client: unknown, args: unknown) => Promise<boolean>>();
+
+jest.mock("viem/actions", () => ({
+  verifyMessage: (client: unknown, args: unknown) =>
+    mockVerifyMessageOnchain(client, args),
+}));
+
+import {
+  verifyGasPaymentSignature,
+  verifyTransferSignature,
+  verifyWithdrawalSignature,
+} from "../../../src/common/signature-verification";
 
 // Test accounts (EVM)
 const testPrivateKey =
@@ -106,7 +130,7 @@ const baseData = {
 // Helpers
 
 // All VMs sign the same SHA256(json-stable-stringify(params)) digest
-const computeDigest = (data: OwnerSignatureData): string =>
+const computeDigest = (data: TestSignatureData): string =>
   crypto
     .createHash("sha256")
     .update(
@@ -120,6 +144,12 @@ const computeDigest = (data: OwnerSignatureData): string =>
         recipient: data.recipient,
         nonce: data.nonce,
         additionalData: data.additionalData,
+        ...(data.operation === "gas-payment"
+          ? {
+              feeCurrency: data.feeCurrency,
+              feeAmount: data.feeAmount,
+            }
+          : {}),
       })!,
     )
     .digest()
@@ -127,7 +157,7 @@ const computeDigest = (data: OwnerSignatureData): string =>
 
 // Helper: sign EVM (personal_sign over raw SHA256 bytes)
 const signEvmMessage = async (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   account = wallet,
 ) => {
   const digest = computeDigest(data);
@@ -147,7 +177,7 @@ const xrpKeypair = (algorithm: "ecdsa-secp256k1" | "ed25519") => {
 // memo. `signOverrides` only alters the content that gets SIGNED, producing a
 // blob whose TxnSignature covers different bytes than the blob carries.
 const signXrpAuthorization = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   keypair: { privateKey: string; publicKey: string; address: string },
   overrides?: Record<string, unknown>,
   signOverrides?: Record<string, unknown>,
@@ -178,7 +208,7 @@ const signXrpAuthorization = (
 };
 
 // Helper: Solana (Ed25519 sign over SHA256 hex string as UTF-8 bytes)
-const signSolanaMessage = (data: OwnerSignatureData, keypair: Keypair) => {
+const signSolanaMessage = (data: TestSignatureData, keypair: Keypair) => {
   const digestBytes = Buffer.from(computeDigest(data), "utf-8");
   const sigBytes = ed25519.sign(digestBytes, keypair.secretKey.slice(0, 32));
   return "0x" + Buffer.from(sigBytes).toString("hex");
@@ -188,7 +218,7 @@ const signSolanaMessage = (data: OwnerSignatureData, keypair: Keypair) => {
 const ECPair = ECPairFactory(ecc);
 
 const signBitcoinMessage = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   privateKey: Buffer,
   compressed: boolean,
   segwitType?: "p2wpkh" | "p2sh(p2wpkh)",
@@ -207,7 +237,7 @@ const signBitcoinMessage = (
 const TRON_MESSAGE_PREFIX = "\x19TRON Signed Message:\n";
 
 const signTronMessage = async (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   account = wallet,
 ) => {
   const digest = computeDigest(data);
@@ -224,7 +254,7 @@ const signTronMessage = async (
 initEccLib(ecc);
 
 const signBip322Taproot = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   internalPrivateKey: Buffer,
 ): { signature: string; address: string } => {
   const message = computeDigest(data);
@@ -307,7 +337,7 @@ const signBip322Taproot = (
 // Helper: BIP-322 P2WPKH signing — full witness format (as OKX/Leather wallets produce)
 // Witness: 02 <sig_len> <DER_sig + sighash_byte> <pk_len=21> <compressed_pubkey>
 const signBip322Segwit = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   privateKey: Buffer,
 ): { signature: string; address: string } => {
   const message = computeDigest(data);
@@ -385,7 +415,7 @@ const signBip322Segwit = (
 // Helper: BIP-322 P2SH-P2WPKH signing — nested witness format
 // Address starts with "3" (mainnet). Witness same as P2WPKH but scriptPubKey is P2SH(P2WPKH).
 const signBip322NestedSegwit = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   privateKey: Buffer,
 ): { signature: string; address: string } => {
   const message = computeDigest(data);
@@ -466,7 +496,7 @@ const evmToTronAddress = (evmAddress: string): string => {
 // Helper: TON TonConnect signData (Ed25519 over TonConnect-prefixed message)
 // sha256(0xff ++ 0xff ++ "ton-connect" ++ sha256(domainData) ++ timestamp_i64le ++ sha256(payload))
 const signTonSignData = (
-  data: OwnerSignatureData,
+  data: TestSignatureData,
   privateKey: Uint8Array, // 32-byte Ed25519 seed
   domain: string,
   timestamp: number,
@@ -554,14 +584,19 @@ beforeAll(() => {
     vmType: "xrp-vm",
     httpRpcUrl: "http://localhost:5005",
   };
+  mockChains["no-rpc-evm"] = {
+    id: "no-rpc-evm",
+    vmType: "ethereum-vm",
+    httpRpcUrl: "",
+  };
 });
 
-describe("verifyOwnerSignature", () => {
+describe("signature verification", () => {
   describe("EVM / Hyperliquid", () => {
     it("should pass with valid EVM signature", async () => {
       const signature = await signEvmMessage(baseData);
       await expect(
-        verifyOwnerSignature({ data: baseData, signature }),
+        verifyWithdrawalSignature({ data: baseData, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -569,18 +604,135 @@ describe("verifyOwnerSignature", () => {
       const data = { ...baseData, ownerChainId: "999" };
       const signature = await signEvmMessage(data);
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
     it("should reject a signature bound to a different operation", async () => {
       const signature = await signEvmMessage(baseData);
       await expect(
-        verifyOwnerSignature({
-          data: { ...baseData, operation: "transfer" },
+        verifyTransferSignature({ data: baseData, signature }),
+      ).rejects.toThrow("Invalid signature");
+    });
+
+    it("should pass with a valid transfer signature", async () => {
+      const data: TestSignatureData = {
+        ...baseData,
+        operation: "transfer",
+      };
+      const signature = await signEvmMessage(data);
+
+      await expect(
+        verifyTransferSignature({ data, signature }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("binds gas-payment signatures to the fee currency and amount", async () => {
+      const data: TestSignatureData = {
+        ...baseData,
+        operation: "gas-payment",
+        feeCurrency: "0x0000000000000000000000000000000000000000",
+        feeAmount: "250000",
+      };
+      const signature = await signEvmMessage(data);
+
+      await expect(
+        verifyGasPaymentSignature({ data, signature }),
+      ).resolves.toBeUndefined();
+      await expect(
+        verifyGasPaymentSignature({
+          data: { ...data, feeAmount: "250001" },
           signature,
         }),
       ).rejects.toThrow("Invalid signature");
+      await expect(
+        verifyGasPaymentSignature({
+          data: {
+            ...data,
+            feeCurrency: "0x1111111111111111111111111111111111111111",
+          },
+          signature,
+        }),
+      ).rejects.toThrow("Invalid signature");
+    });
+  });
+
+  describe("EVM smart-contract wallets (EIP-1271, e.g. Safe multisig)", () => {
+    // A Safe with multiple owners produces a concatenated blob of 65-byte
+    // owner signatures — never recoverable via plain ECDSA.
+    const safeAddress = "0x5afE3855358E112B5647B952709E6165e1c1eEEe";
+    const contractSignature = "0x" + "11".repeat(130);
+    const safeData = { ...baseData, owner: safeAddress };
+
+    beforeEach(() => {
+      mockVerifyMessageOnchain.mockReset();
+    });
+
+    it("should pass when on-chain EIP-1271 verification succeeds", async () => {
+      mockVerifyMessageOnchain.mockResolvedValue(true);
+      await expect(
+        verifyWithdrawalSignature({ data: safeData, signature: contractSignature }),
+      ).resolves.toBeUndefined();
+
+      expect(mockVerifyMessageOnchain).toHaveBeenCalledTimes(1);
+      const [, args] = mockVerifyMessageOnchain.mock.calls[0] as [
+        unknown,
+        { address: string; message: { raw: string }; signature: string },
+      ];
+      expect(args.address).toBe(safeAddress);
+      expect(args.signature).toBe(contractSignature);
+      expect(args.message.raw).toBe(`0x${computeDigest(safeData)}`);
+    });
+
+    it("should reject when on-chain EIP-1271 verification fails", async () => {
+      mockVerifyMessageOnchain.mockResolvedValue(false);
+      await expect(
+        verifyWithdrawalSignature({ data: safeData, signature: contractSignature }),
+      ).rejects.toThrow("Invalid signature");
+      // Both personal_sign encodings are attempted: raw 32 bytes + UTF-8 text.
+      expect(mockVerifyMessageOnchain).toHaveBeenCalledTimes(2);
+    });
+
+    it("should pass when only the UTF-8 text encoding verifies (Safe{Wallet})", async () => {
+      // Safe{Wallet} signs the digest hex string as UTF-8 text rather than
+      // raw bytes — the raw-bytes attempt fails, the text attempt succeeds.
+      mockVerifyMessageOnchain.mockImplementation(
+        async (_client: unknown, args: unknown) =>
+          typeof (args as { message: unknown }).message === "string",
+      );
+      await expect(
+        verifyWithdrawalSignature({ data: safeData, signature: contractSignature }),
+      ).resolves.toBeUndefined();
+
+      expect(mockVerifyMessageOnchain).toHaveBeenCalledTimes(2);
+      const [, textArgs] = mockVerifyMessageOnchain.mock.calls[1] as [
+        unknown,
+        { address: string; message: string; signature: string },
+      ];
+      expect(textArgs.message).toBe(`0x${computeDigest(safeData)}`);
+    });
+
+    it("should reject when on-chain EIP-1271 verification errors", async () => {
+      mockVerifyMessageOnchain.mockRejectedValue(new Error("rpc down"));
+      await expect(
+        verifyWithdrawalSignature({ data: safeData, signature: contractSignature }),
+      ).rejects.toThrow("Invalid signature");
+    });
+
+    it("should not hit the RPC for a valid EOA signature", async () => {
+      const signature = await signEvmMessage(baseData);
+      await expect(
+        verifyWithdrawalSignature({ data: baseData, signature }),
+      ).resolves.toBeUndefined();
+      expect(mockVerifyMessageOnchain).not.toHaveBeenCalled();
+    });
+
+    it("should reject a contract signature when the owner chain has no RPC", async () => {
+      const data = { ...safeData, ownerChainId: "no-rpc-evm" };
+      await expect(
+        verifyWithdrawalSignature({ data, signature: contractSignature }),
+      ).rejects.toThrow("Invalid signature");
+      expect(mockVerifyMessageOnchain).not.toHaveBeenCalled();
     });
   });
 
@@ -595,7 +747,7 @@ describe("verifyOwnerSignature", () => {
       };
       const signature = await signEvmMessage(data);
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
   });
@@ -621,7 +773,7 @@ describe("verifyOwnerSignature", () => {
     it("should pass with valid TON TonConnect signData signature", async () => {
       const signature = signTonSignData(tonData, tonPrivKey, tonDomain, tonTimestamp);
       await expect(
-        verifyOwnerSignature({ data: tonData, signature }),
+        verifyWithdrawalSignature({ data: tonData, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -629,14 +781,14 @@ describe("verifyOwnerSignature", () => {
       const otherPrivKey = ed25519.utils.randomPrivateKey();
       const signature = signTonSignData(tonData, otherPrivKey, tonDomain, tonTimestamp);
       await expect(
-        verifyOwnerSignature({ data: tonData, signature }),
+        verifyWithdrawalSignature({ data: tonData, signature }),
       ).rejects.toThrow("Invalid signature");
     });
 
     it("should throw with tampered message", async () => {
       const signature = signTonSignData(tonData, tonPrivKey, tonDomain, tonTimestamp);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tonData, amount: "9999" },
           signature,
         }),
@@ -646,7 +798,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw with wrong timestamp in signatureMetadata", async () => {
       const signature = signTonSignData(tonData, tonPrivKey, tonDomain, tonTimestamp);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...tonData,
             signatureMetadata: { "ton-vm": { timestamp: tonTimestamp + 1, domain: tonDomain } },
@@ -658,7 +810,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw when timestamp is missing from signatureMetadata", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tonData, signatureMetadata: {} },
           signature: "0x" + "ab".repeat(64),
         }),
@@ -668,14 +820,14 @@ describe("verifyOwnerSignature", () => {
     it("should throw when get_public_key fails", async () => {
       mockTonPublicKey = null;
       await expect(
-        verifyOwnerSignature({ data: tonData, signature: "0x" + "ab".repeat(64) }),
+        verifyWithdrawalSignature({ data: tonData, signature: "0x" + "ab".repeat(64) }),
       ).rejects.toThrow("get_public_key failed");
     });
 
     it("should throw when domain is missing from signatureMetadata", async () => {
       await expect(
-        verifyOwnerSignature({
-          data: { ...tonData, signatureMetadata: { "ton-vm": { timestamp: tonTimestamp } } } as unknown as OwnerSignatureData,
+        verifyWithdrawalSignature({
+          data: { ...tonData, signatureMetadata: { "ton-vm": { timestamp: tonTimestamp } } } as unknown as TestSignatureData,
           signature: "0x" + "ab".repeat(64),
         }),
       ).rejects.toThrow("Missing ton-vm domain");
@@ -684,7 +836,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw with invalid domain (not a subdomain)", async () => {
       const signature = signTonSignData(tonData, tonPrivKey, "aaarelay.link", tonTimestamp);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tonData, signatureMetadata: { "ton-vm": { timestamp: tonTimestamp, domain: "aaarelay.link" } } },
           signature,
         }),
@@ -695,7 +847,7 @@ describe("verifyOwnerSignature", () => {
       const subDomain = "app.relay.link";
       const signature = signTonSignData(tonData, tonPrivKey, subDomain, tonTimestamp);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tonData, signatureMetadata: { "ton-vm": { timestamp: tonTimestamp, domain: subDomain } } },
           signature,
         }),
@@ -709,7 +861,7 @@ describe("verifyOwnerSignature", () => {
         httpRpcUrl: "http://localhost:8080",
       };
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tonData, ownerChainId: "ton-nodomain" },
           signature: "0x" + "ab".repeat(64),
         }),
@@ -730,7 +882,7 @@ describe("verifyOwnerSignature", () => {
       // signMessageV2 uses EIP-191 personal_sign over human-readable message
       const signature = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: tronData,
           signature,
         }),
@@ -746,7 +898,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw with wrong Tron signer", async () => {
       const signature = await signTronMessage(tronData, otherWallet);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: tronData,
           signature,
         }),
@@ -756,7 +908,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw with tampered Tron message", async () => {
       const signature = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tronData, amount: "9999" },
           signature,
         }),
@@ -777,7 +929,7 @@ describe("verifyOwnerSignature", () => {
     it("should pass with valid Solana Ed25519 signature", async () => {
       const signature = signSolanaMessage(solanaData, solanaKeypair);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: solanaData,
           signature,
         }),
@@ -793,7 +945,7 @@ describe("verifyOwnerSignature", () => {
       const otherKeypair = Keypair.generate();
       const signature = signSolanaMessage(solanaData, otherKeypair);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: solanaData,
           signature,
         }),
@@ -803,7 +955,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw with tampered Solana message", async () => {
       const signature = signSolanaMessage(solanaData, solanaKeypair);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...solanaData, amount: "9999" },
           signature,
         }),
@@ -812,7 +964,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with invalid Base58 owner", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...solanaData, owner: "not-valid-base58!!!" },
           signature: "0x" + "ab".repeat(64),
         }),
@@ -821,7 +973,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with signature too short", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: solanaData,
           signature: "0x" + "ab".repeat(32),
         }),
@@ -835,7 +987,7 @@ describe("verifyOwnerSignature", () => {
       };
       const signature = signSolanaMessage(data, solanaKeypair);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -864,7 +1016,7 @@ describe("verifyOwnerSignature", () => {
         btcKeyPair.compressed,
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -884,7 +1036,7 @@ describe("verifyOwnerSignature", () => {
         "p2sh(p2wpkh)",
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -904,7 +1056,7 @@ describe("verifyOwnerSignature", () => {
         "p2wpkh",
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -925,7 +1077,7 @@ describe("verifyOwnerSignature", () => {
         "p2wpkh",
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -934,7 +1086,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with invalid Bitcoin address", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...baseData,
             ownerChainId: "bitcoin-mainnet",
@@ -963,7 +1115,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(taprootKey.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -985,7 +1137,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(keyB.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).rejects.toThrow("Invalid signature");
     });
 
@@ -1005,7 +1157,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(key.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...data, amount: "9999" },
           signature,
         }),
@@ -1032,7 +1184,7 @@ describe("verifyOwnerSignature", () => {
       expect(sigBytes.length).toBeGreaterThan(65);
       expect(sigBytes[0]).toBe(0x02); // 2 witness items
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -1053,7 +1205,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(keyB.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).rejects.toThrow("Invalid signature");
     });
 
@@ -1074,7 +1226,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(key.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -1095,7 +1247,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(keyB.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).rejects.toThrow("Invalid signature");
     });
 
@@ -1112,7 +1264,7 @@ describe("verifyOwnerSignature", () => {
         "p2wpkh",
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...data, amount: "9999" },
           signature,
         }),
@@ -1131,7 +1283,7 @@ describe("verifyOwnerSignature", () => {
         btcKeyPair.compressed,
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...data, amount: "9999" },
           signature,
         }),
@@ -1154,7 +1306,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(key.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...data, amount: "9999" },
           signature,
         }),
@@ -1169,7 +1321,7 @@ describe("verifyOwnerSignature", () => {
         Buffer.from(key.privateKey!),
       );
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...baseData,
             ownerChainId: "bitcoin-mainnet",
@@ -1200,7 +1352,7 @@ describe("verifyOwnerSignature", () => {
         "p2wpkh",
       );
       await expect(
-        verifyOwnerSignature({ data, signature: bip137Sig }),
+        verifyWithdrawalSignature({ data, signature: bip137Sig }),
       ).rejects.toThrow("Invalid signature");
     });
 
@@ -1221,13 +1373,13 @@ describe("verifyOwnerSignature", () => {
         2 + Math.floor((signature.length - 2) / 2),
       );
       await expect(
-        verifyOwnerSignature({ data, signature: truncated }),
+        verifyWithdrawalSignature({ data, signature: truncated }),
       ).rejects.toThrow();
     });
 
     it("should throw with empty Bitcoin signature", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...baseData,
             ownerChainId: "bitcoin-mainnet",
@@ -1253,7 +1405,7 @@ describe("verifyOwnerSignature", () => {
 
       const tronSig = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...tronData,
             ownerChainId: "solana-mainnet",
@@ -1274,7 +1426,7 @@ describe("verifyOwnerSignature", () => {
       const solanaSig = signSolanaMessage(solanaData, solanaKeypair);
 
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: tronData,
           signature: solanaSig,
         }),
@@ -1284,7 +1436,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw on cross-chain replay with different chainId", async () => {
       const signature = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tronData, chainId: "999" },
           signature,
         }),
@@ -1294,7 +1446,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw on cross-recipient replay", async () => {
       const signature = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...tronData,
             recipient: "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
@@ -1307,7 +1459,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw on cross-nonce replay", async () => {
       const signature = await signTronMessage(tronData);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tronData, nonce: "999" },
           signature,
         }),
@@ -1316,7 +1468,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw descriptive error for unknown ownerChainId", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...baseData, ownerChainId: "nonexistent-chain" },
           signature: "0x" + "00".repeat(65),
         }),
@@ -1334,7 +1486,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with signature too long", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: tronData,
           signature: "0x" + "ab".repeat(130),
         }),
@@ -1343,7 +1495,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with all-zero signature", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: tronData,
           signature: "0x" + "00".repeat(65),
         }),
@@ -1352,7 +1504,7 @@ describe("verifyOwnerSignature", () => {
 
     it("should throw with invalid Tron address owner", async () => {
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: {
             ...tronData,
             owner: "Tinvalid",
@@ -1375,7 +1527,7 @@ describe("verifyOwnerSignature", () => {
     it("should pass with undefined additionalData", async () => {
       const sig = await signTronMessage({ ...tronBase });
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: { ...tronBase },
           signature: sig,
         }),
@@ -1386,7 +1538,7 @@ describe("verifyOwnerSignature", () => {
       const data = { ...tronBase, additionalData: {} };
       const signature = await signTronMessage(data);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -1400,7 +1552,7 @@ describe("verifyOwnerSignature", () => {
       };
       const signature = await signTronMessage(data);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -1414,7 +1566,7 @@ describe("verifyOwnerSignature", () => {
       };
       const signature = await signTronMessage(data);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -1429,7 +1581,7 @@ describe("verifyOwnerSignature", () => {
       const data = { ...tronBase, additionalData: largeData };
       const signature = await signTronMessage(data);
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data,
           signature,
         }),
@@ -1441,7 +1593,7 @@ describe("verifyOwnerSignature", () => {
       const signature = await signTronMessage(dataA);
       const dataB = { ...tronBase, additionalData: { a: 2, z: 1 } };
       await expect(
-        verifyOwnerSignature({
+        verifyWithdrawalSignature({
           data: dataB,
           signature,
         }),
@@ -1452,7 +1604,7 @@ describe("verifyOwnerSignature", () => {
   describe("XRP signed-tx-blob authorization", () => {
     const secp = xrpKeypair("ecdsa-secp256k1");
     const eddsa = xrpKeypair("ed25519");
-    const xrpData = (owner: string): OwnerSignatureData => ({
+    const xrpData = (owner: string): TestSignatureData => ({
       ...baseData,
       ownerChainId: "xrp",
       owner,
@@ -1462,7 +1614,7 @@ describe("verifyOwnerSignature", () => {
       const data = xrpData(secp.address);
       const signature = signXrpAuthorization(data, secp);
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -1470,7 +1622,7 @@ describe("verifyOwnerSignature", () => {
       const data = xrpData(eddsa.address);
       const signature = signXrpAuthorization(data, eddsa);
       await expect(
-        verifyOwnerSignature({ data, signature }),
+        verifyWithdrawalSignature({ data, signature }),
       ).resolves.toBeUndefined();
     });
 
@@ -1479,7 +1631,7 @@ describe("verifyOwnerSignature", () => {
       const signature = signXrpAuthorization(data, secp);
       const tampered = { ...data, amount: "2000000" };
       await expect(
-        verifyOwnerSignature({ data: tampered, signature }),
+        verifyWithdrawalSignature({ data: tampered, signature }),
       ).rejects.toThrow(/memo must equal the digest/);
     });
 
@@ -1490,7 +1642,7 @@ describe("verifyOwnerSignature", () => {
         Amount: "1",
         Destination: eddsa.address,
       });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must be an AccountSet/,
       );
     });
@@ -1498,7 +1650,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw for a submittable Fee", async () => {
       const data = xrpData(secp.address);
       const signature = signXrpAuthorization(data, secp, { Fee: "10" });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must be an AccountSet with Fee 0 and Sequence 0/,
       );
     });
@@ -1506,7 +1658,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw for a submittable Sequence", async () => {
       const data = xrpData(secp.address);
       const signature = signXrpAuthorization(data, secp, { Sequence: 105458838 });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must be an AccountSet with Fee 0 and Sequence 0/,
       );
     });
@@ -1515,7 +1667,7 @@ describe("verifyOwnerSignature", () => {
       const data = xrpData(secp.address);
       // asfDisableMaster — the most dangerous flag if the blob ever became submittable
       const signature = signXrpAuthorization(data, secp, { SetFlag: 4 });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must not carry account flags/,
       );
     });
@@ -1526,7 +1678,7 @@ describe("verifyOwnerSignature", () => {
       const signature = signXrpAuthorization(data, secp, {
         TicketSequence: 105458838,
       });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must not carry account flags or a TicketSequence/,
       );
     });
@@ -1543,7 +1695,7 @@ describe("verifyOwnerSignature", () => {
       const signature = signXrpAuthorization(data, secp, {
         Memos: [memo, memo],
       });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /must carry exactly one memo/,
       );
     });
@@ -1553,7 +1705,7 @@ describe("verifyOwnerSignature", () => {
       // signing account is not the request owner.
       const data = xrpData(eddsa.address);
       const signature = signXrpAuthorization(data, secp);
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /Signer does not match owner/,
       );
     });
@@ -1565,7 +1717,7 @@ describe("verifyOwnerSignature", () => {
       const signature = signXrpAuthorization(data, eddsa, {
         Account: secp.address,
       });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /Signer does not match owner/,
       );
     });
@@ -1576,7 +1728,7 @@ describe("verifyOwnerSignature", () => {
       const signature = signXrpAuthorization(data, secp, undefined, {
         Sequence: 1,
       });
-      await expect(verifyOwnerSignature({ data, signature })).rejects.toThrow(
+      await expect(verifyWithdrawalSignature({ data, signature })).rejects.toThrow(
         /Invalid signature/,
       );
     });
@@ -1584,7 +1736,7 @@ describe("verifyOwnerSignature", () => {
     it("should throw for a garbage blob", async () => {
       const data = xrpData(secp.address);
       await expect(
-        verifyOwnerSignature({ data, signature: "0xdeadbeef" }),
+        verifyWithdrawalSignature({ data, signature: "0xdeadbeef" }),
       ).rejects.toThrow(/Invalid xrp-vm signed transaction blob/);
     });
   });

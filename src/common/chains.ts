@@ -17,10 +17,9 @@ export type Chain = {
   depository?: string;
   // During migration periods, chains can have extra depositories (currently supported for "bitcoin-vm", "hyperliquid-vm", and "lighter-vm")
   additionalDepositories?: string[];
-  // The numeric id of the chain on the Hub - for "ethereum-vm" chains this is the EVM chain id,
-  // and for all other chains it is the `keccak256` value of the above user-friendly id
-  hubChainId?: string;
   additionalData?: {
+    // For "ethereum-vm"
+    evmChainId?: string;
     // For "bitcoin-vm" / "ethereum-vm" / "tron-vm";
     // for "ton-vm" — masterchain blocks past the tx's mc anchor
     finalizationBlocks?: number;
@@ -44,6 +43,9 @@ export type Chain = {
     // Fast-mode configurations
     fastMode?: {
       feeRecipient?: string;
+      // Chain + currency address fees are charged in, resolved to its hub
+      // token id at attest time (required when any tier has a non-zero feeBps)
+      feeCurrency?: { chainId: string; currency: string };
       // Finality tiers per currency
       finalityTiers?: {
         [currency: string]: Array<{
@@ -55,6 +57,25 @@ export type Chain = {
         }>;
       };
     };
+  };
+  // For "gateway-vm": physical source and destinations for this Gateway-backed Hub token
+  gateway?: {
+    source: {
+      id: string;
+      gatewayDepository: string;
+      usdc: string;
+      circleDomain: number;
+      blockTimeSeconds?: number;
+      withdrawalDelaySeconds?: number;
+      executionExpirationSeconds?: number;
+      maxBlockHeightTolerance?: number;
+    };
+    destinations: Array<{
+      id: string;
+      gatewayDepository: string;
+      usdc: string;
+      circleDomain: number;
+    }>;
   };
 };
 
@@ -102,6 +123,45 @@ const resolveHttpRpcUrl = (
   return localRpcValue ?? settlementRpcFallback;
 };
 
+const readGatewayConfig = (rawChain: Record<string, any>): Chain["gateway"] => {
+  if (!rawChain.gateway) {
+    return undefined;
+  }
+
+  const source = rawChain.gateway.source;
+
+  return {
+    source: {
+      id: readConfigValue(source?.id) as string,
+      gatewayDepository: readConfigValue(source?.gatewayDepository) as string,
+      usdc: readConfigValue(source?.usdc) as string,
+      circleDomain: readConfigValue(source?.circleDomain) as number,
+      blockTimeSeconds: readConfigValue(source?.blockTimeSeconds) as
+        | number
+        | undefined,
+      withdrawalDelaySeconds: readConfigValue(
+        source?.withdrawalDelaySeconds,
+      ) as number | undefined,
+      executionExpirationSeconds: readConfigValue(
+        source?.executionExpirationSeconds,
+      ) as number | undefined,
+      maxBlockHeightTolerance: readConfigValue(
+        source?.maxBlockHeightTolerance,
+      ) as number | undefined,
+    },
+    destinations: (rawChain.gateway.destinations ?? []).map(
+      (rawDestination: Record<string, any>) => ({
+        id: readConfigValue(rawDestination.id) as string,
+        gatewayDepository: readConfigValue(
+          rawDestination.gatewayDepository,
+        ) as string,
+        usdc: readConfigValue(rawDestination.usdc) as string,
+        circleDomain: readConfigValue(rawDestination.circleDomain) as number,
+      }),
+    ),
+  };
+};
+
 const warnInvalidChainConfiguration = (chain: Chain) => {
   const chainName = chain.id ?? "<missing-id>";
 
@@ -112,7 +172,9 @@ const warnInvalidChainConfiguration = (chain: Chain) => {
     logger.warn("chains", `Chain ${chainName} is missing vmType`);
   }
   if (!chain.httpRpcUrl) {
-    logger.warn("chains", `Chain ${chainName} is missing httpRpcUrl`);
+    if (chain.vmType !== "gateway-vm") {
+      logger.warn("chains", `Chain ${chainName} is missing httpRpcUrl`);
+    }
   }
   if (
     chain.vmType &&
@@ -123,6 +185,76 @@ const warnInvalidChainConfiguration = (chain: Chain) => {
       "chains",
       `Chain ${chainName} (${chain.vmType}) is missing depository`,
     );
+  }
+  if (chain.vmType === "gateway-vm") {
+    if (!chain.gateway?.source?.id) {
+      logger.warn("chains", `Gateway chain ${chainName} is missing source`);
+    }
+    if (!chain.gateway?.destinations.length) {
+      logger.warn("chains", `Gateway chain ${chainName} has no destinations`);
+    }
+  }
+  const source = chain.gateway?.source;
+  if (source) {
+    if (!source.gatewayDepository) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing gatewayDepository`,
+      );
+    }
+    if (!source.usdc) {
+      logger.warn("chains", `Gateway source ${source.id} is missing USDC`);
+    }
+    if (!Number.isInteger(source.circleDomain)) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing circleDomain`,
+      );
+    }
+    if (!Number.isInteger(source.blockTimeSeconds)) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing blockTimeSeconds`,
+      );
+    }
+    if (!Number.isInteger(source.withdrawalDelaySeconds)) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing withdrawalDelaySeconds`,
+      );
+    }
+    if (!Number.isInteger(source.executionExpirationSeconds)) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing executionExpirationSeconds`,
+      );
+    }
+    if (!Number.isInteger(source.maxBlockHeightTolerance)) {
+      logger.warn(
+        "chains",
+        `Gateway source ${source.id} is missing maxBlockHeightTolerance`,
+      );
+    }
+  }
+  for (const destination of chain.gateway?.destinations ?? []) {
+    if (!destination.gatewayDepository) {
+      logger.warn(
+        "chains",
+        `Gateway destination ${destination.id} is missing gatewayDepository`,
+      );
+    }
+    if (!destination.usdc) {
+      logger.warn(
+        "chains",
+        `Gateway destination ${destination.id} is missing USDC`,
+      );
+    }
+    if (!Number.isInteger(destination.circleDomain)) {
+      logger.warn(
+        "chains",
+        `Gateway destination ${destination.id} is missing circleDomain`,
+      );
+    }
   }
 };
 
@@ -137,29 +269,25 @@ export const getChains = async () => {
     ) as Record<string, any>[];
     for (const chain of chains) {
       const chainId = readConfigValue(chain.id);
-      const localHubChainId = readConfigValue(chain.hubChainId);
+      const configuredVmType = readConfigValue(chain.vmType) as
+        | VmType
+        | undefined;
       const settlementDefaults = chainId
-        ? getSettlementChainDefaultsForChain(
-            chainId as string,
-            localHubChainId as string | undefined,
-          )
+        ? getSettlementChainDefaultsForChain(chainId as string)
         : undefined;
       const additionalData = readAdditionalData(chain);
 
       const resolvedChain: Chain = {
         id: (chainId ?? settlementDefaults?.id) as string,
-        vmType: (readConfigValue(chain.vmType) ??
-          settlementDefaults?.vmType) as VmType,
+        vmType: (configuredVmType ?? settlementDefaults?.vmType) as VmType,
         httpRpcUrl: resolveHttpRpcUrl(chain, settlementDefaults) as string,
         depository: (readConfigValue(chain.depository) ??
           settlementDefaults?.depository) as string | undefined,
         additionalDepositories: readConfigValue(
           chain.additionalDepositories,
         ) as string[] | undefined,
-        hubChainId: (localHubChainId ?? settlementDefaults?.hubChainId) as
-          | string
-          | undefined,
         additionalData,
+        gateway: readGatewayConfig(chain),
       };
 
       warnInvalidChainConfiguration(resolvedChain);
@@ -182,6 +310,70 @@ export const getChain = async (chainId: string) => {
   }
 
   return chains[chainId];
+};
+
+export const getGatewaySource = async (
+  gatewayChain: Chain,
+): Promise<{
+  chain: Chain;
+  gatewayDepository: string;
+  usdc: string;
+  circleDomain: number;
+  blockTimeSeconds?: number;
+  withdrawalDelaySeconds?: number;
+  executionExpirationSeconds?: number;
+  maxBlockHeightTolerance?: number;
+}> => {
+  if (gatewayChain.vmType !== "gateway-vm") {
+    throw externalError(`Chain ${gatewayChain.id} is not a Gateway chain`);
+  }
+  const source = gatewayChain.gateway?.source;
+  if (!source) {
+    throw externalError(`Gateway chain ${gatewayChain.id} has no source`);
+  }
+
+  const chain = await getChain(source.id);
+  return {
+    chain,
+    gatewayDepository: source.gatewayDepository,
+    usdc: source.usdc,
+    circleDomain: source.circleDomain,
+    blockTimeSeconds: source.blockTimeSeconds,
+    withdrawalDelaySeconds: source.withdrawalDelaySeconds,
+    executionExpirationSeconds: source.executionExpirationSeconds,
+    maxBlockHeightTolerance: source.maxBlockHeightTolerance,
+  };
+};
+
+export const getGatewayDestination = async (
+  gatewayChain: Chain,
+  destinationChainId: string,
+): Promise<{
+  chain: Chain;
+  gatewayDepository: string;
+  usdc: string;
+  circleDomain: number;
+}> => {
+  if (gatewayChain.vmType !== "gateway-vm") {
+    throw externalError(`Chain ${gatewayChain.id} is not a Gateway chain`);
+  }
+
+  const destination = gatewayChain.gateway?.destinations.find(
+    (candidate) => candidate.id === destinationChainId,
+  );
+  if (!destination) {
+    throw externalError(
+      `Gateway destination ${destinationChainId} is not configured for ${gatewayChain.id}`,
+    );
+  }
+
+  const chain = await getChain(destination.id);
+  return {
+    chain,
+    gatewayDepository: destination.gatewayDepository,
+    usdc: destination.usdc,
+    circleDomain: destination.circleDomain,
+  };
 };
 
 export const RELAY_CHAIN_ID = "relay";
@@ -220,14 +412,10 @@ let __hubInfo:
       };
       oracleMultisigAddress: string;
       genericMappingAddress: string;
+      withdrawGasPayerAddress?: string;
       allocatorAddress: string;
       executorAddress: string;
       depositAddressManagerAddress: string;
-      auroraHttpRpcUrl: string;
-      auroraEvmChainId: string;
-      auroraAllocatorAddress: string;
-      auroraAllocatorSpenderAddress: string;
-      auroraOracleMultisigAddress: string;
     }
   | undefined;
 
@@ -246,21 +434,14 @@ export const getHubInfo = async () => {
     oracleAddress: readConfigValue(chain.oracleAddress),
     oracleVersion: readConfigValue(chain.oracleVersion),
     rateLimiter: readConfigValue(chain.rateLimiter),
+    feeCalculator: readConfigValue(chain.feeCalculator),
     oracleMultisigAddress: readConfigValue(chain.oracleMultisigAddress),
     genericMappingAddress: readConfigValue(chain.genericMappingAddress),
+    withdrawGasPayerAddress: readConfigValue(chain.withdrawGasPayerAddress),
     allocatorAddress: readConfigValue(chain.allocatorAddress),
     executorAddress: readConfigValue(chain.executorAddress),
     depositAddressManagerAddress: readConfigValue(
       chain.depositAddressManagerAddress,
-    ),
-    auroraHttpRpcUrl: readConfigValue(chain.auroraHttpRpcUrl),
-    auroraEvmChainId: readConfigValue(chain.auroraEvmChainId),
-    auroraAllocatorAddress: readConfigValue(chain.auroraAllocatorAddress),
-    auroraAllocatorSpenderAddress: readConfigValue(
-      chain.auroraAllocatorSpenderAddress,
-    ),
-    auroraOracleMultisigAddress: readConfigValue(
-      chain.auroraOracleMultisigAddress,
     ),
   };
 

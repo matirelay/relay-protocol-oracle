@@ -6,7 +6,6 @@ type SettlementNetworkConfig = {
   family?: VmType;
   slug?: string;
   rpc?: string[];
-  hubChainId?: string;
   contracts?: {
     prod?: {
       depository?: string;
@@ -24,7 +23,6 @@ export type SettlementChainDefaults = {
   vmType: VmType;
   httpRpcUrl?: string;
   depository?: string;
-  hubChainId?: string;
 };
 
 const parseNetworkDefaults = (
@@ -51,7 +49,6 @@ const parseNetworkDefaults = (
       vmType: network.family,
       httpRpcUrl,
       depository,
-      hubChainId: network.hubChainId ?? chainId,
     },
   };
 };
@@ -85,7 +82,6 @@ const settlementDefaults = buildSettlementDefaultsIndex(
 
 export const getSettlementChainDefaultsForChain = (
   chainId: string,
-  localHubChainId?: string,
 ): SettlementChainDefaults | undefined => {
   if (settlementDefaults.bySlug[chainId]) {
     return settlementDefaults.bySlug[chainId];
@@ -93,9 +89,5 @@ export const getSettlementChainDefaultsForChain = (
   if (settlementDefaults.byChainId[chainId]) {
     return settlementDefaults.byChainId[chainId];
   }
-  if (localHubChainId && settlementDefaults.byChainId[localHubChainId]) {
-    return settlementDefaults.byChainId[localHubChainId];
-  }
-
   return undefined;
 };

@@ -5,15 +5,24 @@ import { zeroHash } from "viem";
 import {
   DecodedBitcoinVmWithdrawal,
   decodeWithdrawal,
-  DenormalizedSubmitWithdrawRequest,
   DepositoryWithdrawalMessage,
   DepositoryWithdrawalStatus,
   getDecodedWithdrawalId,
   getVmTypeNativeCurrency,
 } from "@relay-protocol/settlement-sdk";
 
-import { getDeterministicId } from "../../utils";
-import { EnhancedDepositoryDepositMessage, VmAttestor } from "../../vm/types";
+import type { TxHints } from "../..";
+import {
+  getDeterministicId,
+  isNumericFinalityMet,
+  resolveAmountTieredFinality,
+} from "../../utils";
+import {
+  DepositFinality,
+  DepositMode,
+  EnhancedDepositoryDepositMessage,
+  VmAttestor,
+} from "../../vm/types";
 import { Chain, getChain } from "../../../../common/chains";
 import { externalError, internalError } from "../../../../common/error";
 import { getTrackingId, logRpcUsage } from "../../../../common/rpc-usage";
@@ -21,15 +30,24 @@ import { httpRpc } from "../../../../common/vm/bitcoin-vm/rpc";
 
 const VM_TYPE = "bitcoin-vm";
 
+const TX_ID_REGEX = /^[0-9a-f]{64}$/;
+
 const DEPOSIT_ID_REGEX = /^0x[0-9a-fA-F]{64}$/;
 const DEPOSITOR_REGEX = /\|depositor=([^|]+)(?=\|)/g;
+
+type EsploraAccessToken = { token: string; expiration: number };
+let esploraAccessToken: EsploraAccessToken | undefined;
 
 export class BitcoinVmAttestor extends VmAttestor {
   public async getDepositoryDepositMessages(
     chainId: string,
     transactionId: string,
+    _hints?: TxHints,
+    opts?: { mode?: DepositMode },
   ): Promise<EnhancedDepositoryDepositMessage[]> {
     const trackingId = getTrackingId();
+
+    this._requireCanonicalTransactionId(transactionId);
 
     const rpc = await httpRpc(chainId);
 
@@ -40,11 +58,9 @@ export class BitcoinVmAttestor extends VmAttestor {
       throw externalError(`Missing transaction ${transactionId}`);
     }
 
-    // Ensure the transaction is finalized
-    await this._ensureTxFinalization(chainId, transactionId, transaction);
-
     // Get chain configuration
     const chain = await getChain(chainId);
+
     const depository = chain.depository;
     const additionalDepositories = chain.additionalDepositories ?? [];
     if (!depository) {
@@ -141,8 +157,15 @@ export class BitcoinVmAttestor extends VmAttestor {
       throw externalError("Multiple depositories received funds");
     }
     const [[fundedDepository, amount]] = fundedDepositories;
+    const currency = getVmTypeNativeCurrency(VM_TYPE);
 
-    return [
+    const finality = await this._measureFinality(
+      chainId,
+      transactionId,
+      transaction,
+    );
+
+    const messages: EnhancedDepositoryDepositMessage[] = [
       {
         data: {
           chainId,
@@ -157,19 +180,47 @@ export class BitcoinVmAttestor extends VmAttestor {
           depository: fundedDepository,
           depositId: depositId ?? zeroHash,
           depositor,
-          currency: getVmTypeNativeCurrency(VM_TYPE),
+          currency,
           amount: amount.toString(),
         },
         extraData: {
-          timestamp: String(
-            transaction.time ??
-              (await rpc
-                .getBlock(transaction.blockhash)
-                .then((block) => block.time)),
-          ),
+          timestamp: finality.timestamp,
         },
       },
     ];
+
+    // Finality checks
+    const defaultBlocks = await this._getFinalizationBlocks(chainId);
+    if (opts?.mode === "fast" && chain.additionalData?.fastMode) {
+      // Bitcoin has no time dimension — tiers configure blocks only
+      const { required, mode, tiers } = resolveAmountTieredFinality(
+        chain,
+        messages,
+        {
+          finalizationBlocks: defaultBlocks,
+          finalizationTime: 0,
+        },
+      );
+      if (!isNumericFinalityMet(finality, required)) {
+        throw externalError(`Transaction ${transactionId} is not finalized`);
+      }
+
+      messages.forEach((m, i) => {
+        m.extraData.mode = mode;
+        if (m.extraData.mode === "fast") {
+          m.extraData.fastFeeBps = tiers[i]?.feeBps;
+        }
+      });
+    } else if (
+      !isNumericFinalityMet(finality, {
+        finalizationBlocks: defaultBlocks,
+        finalizationTime: 0,
+      })
+    ) {
+      throw externalError(`Transaction ${transactionId} is not finalized`);
+    }
+
+    return messages;
   }
 
   public async getDepositoryWithdrawalMessage(
@@ -324,6 +375,8 @@ export class BitcoinVmAttestor extends VmAttestor {
   ): Promise<bigint> {
     const trackingId = getTrackingId();
 
+    this._requireCanonicalTransactionId(transactionId);
+
     const rpc = await httpRpc(chainId);
 
     // Get transaction details
@@ -353,6 +406,17 @@ export class BitcoinVmAttestor extends VmAttestor {
       );
     }
 
+    // The paid amount below sums every output to the recipient, so a second OP_RETURN
+    // naming another order would let those same outputs be claimed by that order too.
+    const opReturnCount = decodedVouts.filter(
+      ({ opReturn }) => opReturn !== undefined,
+    ).length;
+    if (opReturnCount !== 1) {
+      throw externalError(
+        `Transaction ${transactionId} must have exactly one OP_RETURN`,
+      );
+    }
+
     // Find the amount paid to the specified recipient in the transaction outputs
     let paidAmount = BigInt(0);
     for (const output of transaction.vout) {
@@ -374,22 +438,13 @@ export class BitcoinVmAttestor extends VmAttestor {
     throw internalError("Not implemented");
   }
 
-  public async validateSubmitWithdrawRequest(
-    data: DenormalizedSubmitWithdrawRequest,
-  ): Promise<boolean> {
-    if (!data.additionalData?.["bitcoin-vm"]) {
-      return false;
+  // Validate the transaction id against Bitcoin's canonical hash format.
+  private _requireCanonicalTransactionId(transactionId: string) {
+    if (!TX_ID_REGEX.test(transactionId)) {
+      throw externalError(
+        `Invalid bitcoin-vm transaction id ${transactionId}: expected 64 lowercase hex chars without 0x prefix`,
+      );
     }
-
-    const rpc = await httpRpc(data.chainId);
-    for (const utxo of data.additionalData?.["bitcoin-vm"].allocatorUtxos) {
-      const tx = await rpc.getTransaction(utxo.txid);
-      if (Number(utxo.value) !== tx.vout[utxo.vout].value) {
-        return false;
-      }
-    }
-
-    return true;
   }
 
   private _DEFAULT_FINALIZATION_BLOCKS = 2;
@@ -400,6 +455,27 @@ export class BitcoinVmAttestor extends VmAttestor {
       chain.additionalData?.finalizationBlocks ??
       this._DEFAULT_FINALIZATION_BLOCKS
     );
+  }
+
+  private async _measureFinality(
+    chainId: string,
+    transactionId: string,
+    tx: { confirmations?: number; blockhash?: string; time?: number },
+  ): Promise<DepositFinality> {
+    // An unmined transaction has no block to read and is still replaceable
+    if (!tx.confirmations || !tx.blockhash) {
+      throw externalError(`Transaction ${transactionId} is not finalized`);
+    }
+
+    const rpc = await httpRpc(chainId);
+    const timestamp =
+      tx.time ?? (await rpc.getBlock(tx.blockhash).then((block) => block.time));
+
+    return {
+      confirmations: tx.confirmations,
+      elapsedSeconds: 0,
+      timestamp: String(timestamp),
+    };
   }
 
   private async _ensureTxFinalization(
@@ -477,7 +553,6 @@ export class BitcoinVmAttestor extends VmAttestor {
     });
   }
 
-  _esploraAccessToken: { token: string; expiration: number } | undefined;
   private _getPsbtInputPrevoutScriptHex(
     psbt: bitcoin.Psbt,
     inputIndex: number,
@@ -556,7 +631,9 @@ export class BitcoinVmAttestor extends VmAttestor {
         .map((output) => output.script.toString("hex")),
     );
 
-    return psbtOpReturnScripts.some((script) => onchainOutputScripts.has(script));
+    return psbtOpReturnScripts.some((script) =>
+      onchainOutputScripts.has(script),
+    );
   }
 
   private _getPsbtOpReturnScriptsHex(psbt: bitcoin.Psbt): string[] {
@@ -621,10 +698,10 @@ export class BitcoinVmAttestor extends VmAttestor {
   ) {
     if (esploraCompatibleApiUrl.includes("enterprise.blockstream")) {
       if (
-        this._esploraAccessToken &&
-        this._esploraAccessToken.expiration > Math.floor(Date.now() / 1000)
+        esploraAccessToken &&
+        esploraAccessToken.expiration > Math.floor(Date.now() / 1000)
       ) {
-        return { Authorization: `Bearer ${this._esploraAccessToken.token}` };
+        return { Authorization: `Bearer ${esploraAccessToken.token}` };
       }
 
       const blockstreamLoginUrl =
@@ -655,12 +732,12 @@ export class BitcoinVmAttestor extends VmAttestor {
         (response) => response.json(),
       );
 
-      this._esploraAccessToken = {
+      esploraAccessToken = {
         token: data.access_token,
         expiration: Math.floor(Date.now() / 1000) + data.expires_in,
       };
 
-      return { Authorization: `Bearer ${this._esploraAccessToken?.token}` };
+      return { Authorization: `Bearer ${esploraAccessToken.token}` };
     }
 
     if (esploraCompatibleApiUrl.includes("gomaestro-api")) {

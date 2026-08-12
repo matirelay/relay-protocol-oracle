@@ -1,13 +1,24 @@
 import { describe, expect, it, jest, beforeEach } from "@jest/globals";
+import { Value } from "@sinclair/typebox/value";
 
 import endpoint from "../../../src/api/attestations/withdraw-request-authorization/v1";
 import { validateRecoverMode } from "../../../src/common/recover-mode-verification";
-import { verifyOwnerSignature } from "../../../src/common/signature-verification";
+import { verifyWithdrawalSignature } from "../../../src/common/signature-verification";
 import { signAllocatorWithdrawRequest } from "../../../src/common/signer";
 import { getChain } from "../../../src/common/chains";
 import { normalizeWithdrawRequest } from "@relay-protocol/settlement-sdk";
 
-const NORMALIZED = { normalized: true } as any;
+const NORMALIZED = {
+  chainId: "ethereum",
+  depository: "0xDepository",
+  currency: "0xCurrency",
+  amount: "1000000",
+  spenderChainId: "ethereum",
+  spender: "0xSpender",
+  receiver: "0xReceiver",
+  data: "0x",
+  nonce: `0x${"00".repeat(31)}07`,
+};
 const SIGN_RESULT = {
   allocatorChainId: 1,
   allocatorContract: "0xAllocator0000000000000000000000000000abcd",
@@ -23,13 +34,15 @@ jest.mock("../../../src/common/chains", () => ({
   })),
 }));
 
+const RECOVER_NONCE = `0x${"5a".repeat(32)}`;
+
 jest.mock("../../../src/common/recover-mode-verification", () => ({
   recoverModeSchemaFields: {},
-  validateRecoverMode: jest.fn(async () => undefined),
+  validateRecoverMode: jest.fn(async () => ({ nonce: RECOVER_NONCE })),
 }));
 
 jest.mock("../../../src/common/signature-verification", () => ({
-  verifyOwnerSignature: jest.fn(async () => undefined),
+  verifyWithdrawalSignature: jest.fn(async () => undefined),
 }));
 
 jest.mock("../../../src/common/signer", () => ({
@@ -81,13 +94,22 @@ describe("POST /attestations/withdraw-request-authorization/v1 — recoverMode",
     jest.clearAllMocks();
   });
 
+  it("uses the shared withdrawal nonce schema", () => {
+    expect(
+      Value.Check((endpoint as any).schema.body, {
+        ...recoverBody(),
+        nonce: "123",
+      }),
+    ).toBe(true);
+  });
+
   it("authorizes recoverMode without a user signature and signs the normalized request", async () => {
     const reply = makeReply();
     await (endpoint as any).handler({ body: recoverBody(), headers: {} } as any, reply);
 
     // recoverMode path: validateRecoverMode runs, the user-signature check does not.
     expect(validateRecoverMode).toHaveBeenCalledTimes(1);
-    expect(verifyOwnerSignature).not.toHaveBeenCalled();
+    expect(verifyWithdrawalSignature).not.toHaveBeenCalled();
 
     // validateRecoverMode receives the request fields it needs to authorize.
     const args = (validateRecoverMode as jest.Mock).mock.calls[0][0] as any;
@@ -108,6 +130,30 @@ describe("POST /attestations/withdraw-request-authorization/v1 — recoverMode",
       allocatorContract: SIGN_RESULT.allocatorContract,
       signatures: [{ oracleSigner: SIGN_RESULT.oracleSigner, signature: SIGN_RESULT.signature }],
     });
+  });
+
+  it("signs the oracle-derived nonce, not the one the caller sent", async () => {
+    // recoverMode binds the withdrawal to a single use of the cited deposit, so
+    // the nonce is the oracle's to compute (DEC-1660).
+    await call({ ...recoverBody(), nonce: "0x" + "99".repeat(32) });
+
+    expect(normalizeWithdrawRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ nonce: RECOVER_NONCE }),
+    );
+  });
+
+  it("keeps the caller's nonce on the non-recover path", async () => {
+    const callerNonce = "0x" + "88".repeat(32);
+    await call({
+      ...recoverBody(),
+      recoverMode: false,
+      nonce: callerNonce,
+      ownerSignature: "0x" + "cc".repeat(65),
+    });
+
+    expect(normalizeWithdrawRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ nonce: callerNonce }),
+    );
   });
 
   it("propagates a recoverMode rejection and does not sign", async () => {
@@ -159,7 +205,7 @@ describe("POST /attestations/withdraw-request-authorization/v1 — recoverMode",
     await (endpoint as any).handler({ body, headers: {} } as any, reply);
 
     expect(validateRecoverMode).toHaveBeenCalledTimes(1);
-    expect(verifyOwnerSignature).not.toHaveBeenCalled();
+    expect(verifyWithdrawalSignature).not.toHaveBeenCalled();
     expect(normalizeWithdrawRequest).toHaveBeenCalledWith(
       expect.objectContaining({
         vmType: "xrp-vm",
@@ -208,9 +254,8 @@ describe("POST /attestations/withdraw-request-authorization/v1 — recoverMode",
     const reply = makeReply();
     await (endpoint as any).handler({ body, headers: {} } as any, reply);
 
-    expect(verifyOwnerSignature).toHaveBeenCalledWith({
+    expect(verifyWithdrawalSignature).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        operation: "withdrawal",
         chainId: "lighter",
         additionalData: lighterAdditionalData,
       }),
