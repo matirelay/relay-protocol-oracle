@@ -1,0 +1,11 @@
+[
+  {
+    "id": "elysium",
+    "depository": "ELYSIUM_STAG_DEPOSITORY",
+    "vmType": "ethereum-vm",
+    "httpRpcUrl": "$ELYSIUM_RPC_URL",
+    "additionalData": {
+      "evmChainId": "ELYSIUM_MAINNET_CHAIN_ID"
+    }
+  }
+]
